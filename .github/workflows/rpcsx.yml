@@ -13,34 +13,34 @@ jobs:
   build-linux:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-    - name: Checkout
-      uses: actions/checkout@v4
-      with:
-        submodules: recursive
+      - name: Setup dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y cmake build-essential libunwind-dev \
+            libsox-dev g++-14 ninja-build libasound2-dev nasm libudev-dev \
+            libxcb1-dev libx11-dev libwayland-dev libxkbcommon-dev libxrandr-dev \
+            libxinerama-dev libxcursor-dev libxi-dev libxext-dev \
+            libglfw3-dev libvulkan-dev vulkan-validationlayers spirv-tools \
+            glslang-tools libspirv-cross-c-shared-dev
 
-    - name: Setup dependencies
-      run: |
-        sudo apt update
-        sudo apt install -y cmake build-essential libunwind-dev \
-          libsox-dev g++-14 ninja-build libasound2-dev nasm libudev-dev \
-          libxcb1-dev libx11-dev libwayland-dev libxkbcommon-dev libxrandr-dev \
-          libxinerama-dev libxcursor-dev libxi-dev libxext-dev
-        cmake -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_INSTALL_PREFIX=/usr
-        cmake --build build -j$(($(nproc) + 2))
-        sudo cmake --build build
+      - name: Build RPCSX
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=g++-14
+          cmake --build build -j$(($(nproc) + 2))
 
-    - name: Build RPCSX
-      run: |
-        cmake -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14
-        cmake --build build -j$(($(nproc) + 2))
-
-    - name: Upload RPCSX
-      uses: actions/upload-artifact@v4
-      with:
-        name: rpcsx-bin
-        path: build/bin/*
-        if-no-files-found: error
+      - name: Upload RPCSX
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpcsx-bin
+          path: build/bin/*
+          if-no-files-found: error
 
   build-android:
     strategy:
@@ -73,63 +73,63 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout repo
-      uses: actions/checkout@v4
-      with:
-        submodules: recursive
-        fetch-depth: 0
-        lfs: true
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          lfs: true
 
-    - name: Setup Java
-      uses: actions/setup-java@v4
-      with:
-        distribution: 'temurin'
-        java-version: 17
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: 17
 
-    - name: Install Ninja
-      run: |
-        sudo apt update
-        sudo apt install ninja-build
+      - name: Install Ninja
+        run: |
+          sudo apt update
+          sudo apt install ninja-build
 
-    - name: Setup Android SDK
-      uses: android-actions/setup-android@v3
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
-    - name: Install packages
-      run: yes | sdkmanager "cmake;${{ env.CMAKE_VERSION }}" "ndk;${{ env.NDK_VERSION }}"
+      - name: Install packages
+        run: yes | sdkmanager "cmake;${{ env.CMAKE_VERSION }}" "ndk;${{ env.NDK_VERSION }}"
 
-    - name: Configure
-      run: |
-        $ANDROID_SDK_ROOT/cmake/${{ env.CMAKE_VERSION }}/bin/cmake \
-        -B build -S android -DANDROID_ABI=${{ matrix.abi }} \
-        -DUSE_ARCH=${{ matrix.arch }} \
-        -DANDROID_PLATFORM=android-29 \
-        -DANDROID_NDK=$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }} \
-        -DCMAKE_TOOLCHAIN_FILE=$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}/build/cmake/android.toolchain.cmake \
-        -DCMAKE_BUILD_TYPE=Release -G Ninja
+      - name: Configure
+        run: |
+          $ANDROID_SDK_ROOT/cmake/${{ env.CMAKE_VERSION }}/bin/cmake \
+            -B build -S android \
+            -DANDROID_ABI=${{ matrix.abi }} \
+            -DUSE_ARCH=${{ matrix.arch }} \
+            -DANDROID_PLATFORM=android-29 \
+            -DANDROID_NDK=$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }} \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}/build/cmake/android.toolchain.cmake \
+            -DCMAKE_BUILD_TYPE=Release -G Ninja
 
-        RX_VERSION=`cat android/.rx.version | awk -F'-' '{print $1}'`
-        RX_SHA=`cat android/.rx.version | awk -F'-' '{print $5}'`
-        echo "RX_VERSION=$RX_VERSION" >> "${{ github.env }}"
-        echo "RX_SHA=$RX_SHA" >> "${{ github.env }}"
+          RX_VERSION=$(cat android/.rx.version | awk -F'-' '{print $1}')
+          RX_SHA=$(cat android/.rx.version | awk -F'-' '{print $5}')
+          echo "RX_VERSION=$RX_VERSION" >> "${{ github.env }}"
+          echo "RX_SHA=$RX_SHA" >> "${{ github.env }}"
 
-    - name: Build
-      run: |
-        $ANDROID_SDK_ROOT/cmake/${{ env.CMAKE_VERSION }}/bin/cmake --build build
-        $ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip build/librpcsx-android.so
-        mv build/librpcsx-android.so librpcsx-android-${{ matrix.abi }}-${{ matrix.arch }}.so
+      - name: Build
+        run: |
+          $ANDROID_SDK_ROOT/cmake/${{ env.CMAKE_VERSION }}/bin/cmake --build build
+          $ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip build/librpcsx-android.so
+          mv build/librpcsx-android.so librpcsx-android-${{ matrix.abi }}-${{ matrix.arch }}.so
 
-    - name: Deploy build
-      uses: softprops/action-gh-release@v2
-      if: |
-        github.event_name != 'pull_request' &&
-        github.ref == 'refs/heads/master' &&
-        github.repository == 'RPCSX/rpcsx'
-      with:
-        prerelease: false
-        make_latest: true
-        repository: Snap888/rpcsx-build
-        token: ${{ secrets.BUILD_TOKEN }}
-        tag_name: v${{ env.RX_VERSION }}-${{ env.RX_SHA }}
-        files: librpcsx-android-${{ matrix.abi }}-${{ matrix.arch }}.so
-        body: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
-
+      - name: Deploy build
+        uses: softprops/action-gh-release@v2
+        if: |
+          github.event_name != 'pull_request' &&
+          github.ref == 'refs/heads/master'
+        with:
+          prerelease: false
+          make_latest: true
+          repository: Snap888/rpcsx-build
+          token: ${{ secrets.BUILD_TOKEN }}
+          tag_name: v${{ env.RX_VERSION }}-${{ env.RX_SHA }}-${{ matrix.abi }}-${{ matrix.arch }}
+          files: librpcsx-android-${{ matrix.abi }}-${{ matrix.arch }}.so
+          body: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
+          
