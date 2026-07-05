@@ -385,10 +385,8 @@ struct Construct {
   CFG &getCfg() {
     return analysis.get<CFG>([this] {
       if (parent != nullptr) {
-        return parent->getCfg().buildView(
-            header,
-            &parent->getPostDomTree(),
-            {header, merge});
+        return parent->getCfg().buildView(header, &parent->getPostDomTree(),
+                                          {header, merge});
       }
 
       return buildCFG(header);
@@ -402,10 +400,8 @@ struct Construct {
 
     return analysis.get<Tag<CFG, kWithoutContinue>>([this] {
       if (parent != nullptr) {
-        return parent->getCfg().buildView(
-            header,
-            &parent->getPostDomTree(),
-            {header, merge}, loopContinue);
+        return parent->getCfg().buildView(header, &parent->getPostDomTree(),
+                                          {header, merge}, loopContinue);
       }
 
       return buildCFG(header, {}, loopContinue);

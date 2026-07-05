@@ -702,7 +702,8 @@ struct CachedHostVisibleBuffer : CachedBuffer {
   using CachedBuffer::update;
 
   bool expensive() {
-    return !rx::g_config.disableGpuCache && addressRange.size() >= rx::mem::pageSize;
+    return !rx::g_config.disableGpuCache &&
+           addressRange.size() >= rx::mem::pageSize;
   }
 
   bool flush(void *target, rx::AddressRange range) {

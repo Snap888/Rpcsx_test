@@ -457,9 +457,9 @@ Ref<orbis::Module> rx::linker::loadModule(std::span<std::byte> image,
 
   auto imageBase = reinterpret_cast<std::byte *>(
       vm::map(reinterpret_cast<void *>(baseAddress),
-                  rx::alignUp(imageSize, vm::kPageSize), 0,
-                  vm::kMapFlagPrivate | vm::kMapFlagAnonymous |
-                      (baseAddress ? vm::kMapFlagFixed : 0)));
+              rx::alignUp(imageSize, vm::kPageSize), 0,
+              vm::kMapFlagPrivate | vm::kMapFlagAnonymous |
+                  (baseAddress ? vm::kMapFlagFixed : 0)));
 
   if (imageBase == MAP_FAILED) {
     std::abort();
