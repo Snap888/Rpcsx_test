@@ -1,3 +1,4 @@
+# .github/workflows/formatting-check.yml
 name: Formatting check
 
 on:
@@ -16,12 +17,46 @@ on:
 jobs:
   formatting-check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Run clang-format
-      uses: jidicula/clang-format-action@v4.13.0
-      with:
-        exclude-regex: (libspirv|3rdparty)
-        clang-format-version: 18
+      - name: Run clang-format
+        uses: jidicula/clang-format-action@v4.15.0
+        with:
+          clang-format-version: 20
+          exclude-regex: (libspirv|3rdparty)
+          check-path: .
+        continue-on-error: true
+        id: format-check
+
+      - name: Setup clang-format for fix
+        if: steps.format-check.outcome == 'failure'
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 20
+          sudo apt install -y clang-format-20
+
+      - name: Apply clang-format
+        if: steps.format-check.outcome == 'failure'
+        run: |
+          find . \( -name "*.cpp" -o -name "*.hpp" -o -name "*.h" -o -name "*.c" \) \
+            ! -path "./.git/*" \
+            ! -path "./3rdparty/*" \
+            ! -path "./libspirv/*" \
+            -exec clang-format-20 -i {} +
+
+      - name: Commit fixes
+        if: steps.format-check.outcome == 'failure'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Apply clang-format fixes"
+          git push
