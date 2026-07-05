@@ -132,7 +132,7 @@ jobs:
         with:
           prerelease: false
           make_latest: true
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.RELEASE_TOKEN }
           tag_name: v${{ env.RX_VERSION }}-${{ env.RX_SHA }}-${{ matrix.abi }}-${{ matrix.arch }}
           files: librpcsx-android-${{ matrix.abi }}-${{ matrix.arch }}.so
           body: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
