@@ -117,12 +117,12 @@ jobs:
         $ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip build/librpcsx-android.so
         mv build/librpcsx-android.so librpcsx-android-${{ matrix.abi }}-${{ matrix.arch }}.so
 
-    - name: Deploy build
+        - name: Deploy build
       uses: softprops/action-gh-release@v2
       if: |
         github.event_name != 'pull_request' &&
         github.ref == 'refs/heads/master' &&
-        github.repository == 'RPCSX/rpcsx'
+        github.repository == 'Snap888/Rpcsx_test'
       with:
         prerelease: false
         make_latest: true
@@ -135,3 +135,4 @@ jobs:
           Commit: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
           ABI: ${{ matrix.abi }}
           Arch: ${{ matrix.arch }}
+
