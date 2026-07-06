@@ -107,12 +107,39 @@ jobs:
     - name: Extract version info
       id: version
       run: |
+        # Читаем файл .rx.version
         RX_VERSION=$(cat android/.rx.version | awk -F'-' '{print $1}')
         RX_SHA=$(cat android/.rx.version | awk -F'-' '{print $5}')
+        
+        # Отладка: показываем что прочитали
+        echo "Raw RX_VERSION: '$RX_VERSION'"
+        echo "Raw RX_SHA: '$RX_SHA'"
+        
+        # Очищаем от пробелов и спецсимволов
+        RX_VERSION=$(echo "$RX_VERSION" | tr -d '[:space:]')
+        RX_SHA=$(echo "$RX_SHA" | tr -d '[:space:]')
+        
+        # Если SHA пустой, используем короткий SHA из git
+        if [ -z "$RX_SHA" ]; then
+          RX_SHA=$(git rev-parse --short HEAD)
+        fi
+        
+        # Ограничиваем SHA до 7 символов (как в оригинале)
+        RX_SHA="${RX_SHA:0:7}"
+        
+        # Формируем тег
+        TAG_NAME="v${RX_VERSION}-${RX_SHA}"
+        
+        # Проверяем валидность тега (только буквы, цифры, точки, дефисы, подчеркивания)
+        if [[ ! "$TAG_NAME" =~ ^v[0-9a-zA-Z._-]+$ ]]; then
+          echo "ERROR: Invalid tag name: '$TAG_NAME'"
+          exit 1
+        fi
+        
+        echo "Final TAG_NAME: '$TAG_NAME'"
         echo "RX_VERSION=$RX_VERSION" >> "$GITHUB_ENV"
         echo "RX_SHA=$RX_SHA" >> "$GITHUB_ENV"
-        echo "rx_version=$RX_VERSION" >> "$GITHUB_OUTPUT"
-        echo "rx_sha=$RX_SHA" >> "$GITHUB_OUTPUT"
+        echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
 
     - name: Build
       run: |
@@ -145,8 +172,20 @@ jobs:
       run: |
         RX_VERSION=$(cat android/.rx.version | awk -F'-' '{print $1}')
         RX_SHA=$(cat android/.rx.version | awk -F'-' '{print $5}')
-        echo "rx_version=$RX_VERSION" >> "$GITHUB_OUTPUT"
-        echo "rx_sha=$RX_SHA" >> "$GITHUB_OUTPUT"
+        
+        # Очищаем
+        RX_VERSION=$(echo "$RX_VERSION" | tr -d '[:space:]')
+        RX_SHA=$(echo "$RX_SHA" | tr -d '[:space:]')
+        
+        if [ -z "$RX_SHA" ]; then
+          RX_SHA=$(git rev-parse --short HEAD)
+        fi
+        RX_SHA="${RX_SHA:0:7}"
+        
+        TAG_NAME="v${RX_VERSION}-${RX_SHA}"
+        
+        echo "TAG_NAME: '$TAG_NAME'"
+        echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
 
     - name: Download all artifacts
       uses: actions/download-artifact@v4
@@ -161,7 +200,7 @@ jobs:
         make_latest: true
         repository: Snap888/rpcsx-build
         token: ${{ secrets.RELEASE_TOKEN2 }}
-        tag_name: v${{ steps.version.outputs.rx_version }}-${{ steps.version.outputs.rx_sha }}
+        tag_name: ${{ steps.version.outputs.tag_name }}
         files: artifacts/android-*/*.so
         body: |
           Build: ${{ github.run_number }}
