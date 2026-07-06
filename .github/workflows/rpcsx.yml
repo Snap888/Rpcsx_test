@@ -21,7 +21,13 @@ jobs:
     - name: Setup dependencies
       run: |
         sudo apt update
-        sudo apt install -y cmake build-essential libunwind-dev           libsox-dev g++-14 ninja-build libasound2-dev nasm libudev-dev           libxcb1-dev libx11-dev libwayland-dev libxkbcommon-dev libxrandr-dev           libxinerama-dev libxcursor-dev libxi-dev libxext-dev
+        sudo apt install -y cmake build-essential libunwind-dev \
+          libsox-dev g++-14 ninja-build libasound2-dev nasm libudev-dev \
+          libxcb1-dev libx11-dev libwayland-dev libxkbcommon-dev libxrandr-dev \
+          libxinerama-dev libxcursor-dev libxi-dev libxext-dev
+        cmake -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_INSTALL_PREFIX=/usr
+        cmake --build build -j$(($(nproc) + 2))
+        sudo cmake --build build
 
     - name: Build RPCSX
       run: |
@@ -60,8 +66,6 @@ jobs:
     env:
       NDK_VERSION: "29.0.13113456"
       CMAKE_VERSION: "3.31.6"
-      RX_VERSION: 'Unknown'
-      RX_SHA: 'Unknown'
 
     runs-on: ubuntu-latest
 
@@ -92,14 +96,23 @@ jobs:
 
     - name: Configure
       run: |
-        $ANDROID_SDK_ROOT/cmake/${{ env.CMAKE_VERSION }}/bin/cmake         -B build -S android -DANDROID_ABI=${{ matrix.abi }}         -DUSE_ARCH=${{ matrix.arch }}         -DANDROID_PLATFORM=android-29         -DANDROID_NDK=$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}         -DCMAKE_TOOLCHAIN_FILE=$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}/build/cmake/android.toolchain.cmake         -DCMAKE_BUILD_TYPE=Release -G Ninja
+        $ANDROID_SDK_ROOT/cmake/${{ env.CMAKE_VERSION }}/bin/cmake \
+        -B build -S android -DANDROID_ABI=${{ matrix.abi }} \
+        -DUSE_ARCH=${{ matrix.arch }} \
+        -DANDROID_PLATFORM=android-29 \
+        -DANDROID_NDK=$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }} \
+        -DCMAKE_TOOLCHAIN_FILE=$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}/build/cmake/android.toolchain.cmake \
+        -DCMAKE_BUILD_TYPE=Release -G Ninja
 
     - name: Extract version info
+      id: version
       run: |
         RX_VERSION=$(cat android/.rx.version | awk -F'-' '{print $1}')
         RX_SHA=$(cat android/.rx.version | awk -F'-' '{print $5}')
         echo "RX_VERSION=$RX_VERSION" >> "$GITHUB_ENV"
         echo "RX_SHA=$RX_SHA" >> "$GITHUB_ENV"
+        echo "rx_version=$RX_VERSION" >> "$GITHUB_OUTPUT"
+        echo "rx_sha=$RX_SHA" >> "$GITHUB_OUTPUT"
 
     - name: Build
       run: |
@@ -107,18 +120,49 @@ jobs:
         $ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip build/librpcsx-android.so
         mv build/librpcsx-android.so librpcsx-android-${{ matrix.abi }}-${{ matrix.arch }}.so
 
-    - name: Deploy build
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: android-${{ matrix.abi }}-${{ matrix.arch }}
+        path: librpcsx-android-${{ matrix.abi }}-${{ matrix.arch }}.so
+        if-no-files-found: error
+
+  release:
+    needs: [build-android]
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name != 'pull_request' &&
+      github.ref == 'refs/heads/master' &&
+      github.repository == 'Snap888/Rpcsx_test'
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Extract version info
+      id: version
+      run: |
+        RX_VERSION=$(cat android/.rx.version | awk -F'-' '{print $1}')
+        RX_SHA=$(cat android/.rx.version | awk -F'-' '{print $5}')
+        echo "rx_version=$RX_VERSION" >> "$GITHUB_OUTPUT"
+        echo "rx_sha=$RX_SHA" >> "$GITHUB_OUTPUT"
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+        pattern: android-*
+
+    - name: Deploy release
       uses: softprops/action-gh-release@v2
-      if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master' && github.repository == 'Snap888/Rpcsx_test'
       with:
         prerelease: false
         make_latest: true
         repository: Snap888/rpcsx-build
         token: ${{ secrets.RELEASE_TOKEN2 }}
-        tag_name: v${{ env.RX_VERSION }}-${{ env.RX_SHA }}-${{ matrix.abi }}-${{ matrix.arch }}
-        files: librpcsx-android-${{ matrix.abi }}-${{ matrix.arch }}.so
+        tag_name: v${{ steps.version.outputs.rx_version }}-${{ steps.version.outputs.rx_sha }}
+        files: artifacts/android-*/*.so
         body: |
           Build: ${{ github.run_number }}
           Commit: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
-          ABI: ${{ matrix.abi }}
-          Arch: ${{ matrix.arch }}
