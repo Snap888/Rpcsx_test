@@ -1711,6 +1711,9 @@ extern "C" bool _rpcsx_overlayPadData(int digital1, int digital2,
   return true;
 }
 
+// ============================================
+// Motion Controls - отправка данных гироскопа и акселерометра
+// ============================================
 extern "C" bool _rpcsx_setMotionData(float accelX, float accelY, float accelZ,
                                      float gyroX, float gyroY, float gyroZ) {
     auto pad = [] {
@@ -1750,10 +1753,11 @@ extern "C" bool _rpcsx_setMotionData(float accelX, float accelY, float accelZ,
     pad->m_sensors[0].m_value = convertAccel(accelX);
     pad->m_sensors[1].m_value = convertAccel(accelY);
     pad->m_sensors[2].m_value = convertAccel(accelZ);
-    pad->m_sensors[3].m_value = convertGyro(gyroX);  // Используем только X для гироскопа
+    pad->m_sensors[3].m_value = convertGyro(gyroX);
 
     return true;
 }
+// ============================================
 
 extern "C" bool _rpcsx_initialize(std::string_view rootDir,
                                   std::string_view user) {
@@ -2685,6 +2689,9 @@ extern "C" void *_rpcsx_setCustomDriver(void *driverHandle) {
   return prevLoader;
 }
 
+// ============================================
+// JNI обёртка для Motion Controls
+// ============================================
 extern "C" JNIEXPORT jboolean JNICALL 
 Java_net_rpcsx_RPCSX_setMotionData(
     JNIEnv *, jobject, 
@@ -2692,5 +2699,6 @@ Java_net_rpcsx_RPCSX_setMotionData(
     jfloat gyroX, jfloat gyroY, jfloat gyroZ) {
     return _rpcsx_setMotionData(accelX, accelY, accelZ, gyroX, gyroY, gyroZ);
 }
+// ============================================
 
 #pragma GCC diagnostic pop
