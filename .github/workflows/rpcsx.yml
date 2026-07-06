@@ -127,7 +127,7 @@ jobs:
         prerelease: false
         make_latest: true
         repository: Snap888/rpcsx-build
-        token: ${{ secrets.RELEASE_TOKEN }}
+        token: ${{ secrets.RELEASE_TOKEN2 }}
         tag_name: v${{ env.RX_VERSION }}-${{ env.RX_SHA }}-${{ matrix.abi }}-${{ matrix.arch }}
         files: librpcsx-android-${{ matrix.abi }}-${{ matrix.arch }}.so
         body: |
