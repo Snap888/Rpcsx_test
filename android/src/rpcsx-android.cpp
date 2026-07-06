@@ -1605,11 +1605,11 @@ static void setupCallbacks() {
 static bool initVirtualPad(const std::shared_ptr<Pad> &pad) {
   u32 pclass_profile = 0;
   pad->Init(CELL_PAD_STATUS_CONNECTED,
-            CELL_PAD_CAPABILITY_PS3_CONFORMITY |
-                CELL_PAD_CAPABILITY_PRESS_MODE |
-                CELL_PAD_CAPABILITY_HP_ANALOG_STICK |
-                CELL_PAD_CAPABILITY_ACTUATOR //| CELL_PAD_CAPABILITY_SENSOR_MODE
-            ,
+          CELL_PAD_CAPABILITY_PS3_CONFORMITY |
+          CELL_PAD_CAPABILITY_PRESS_MODE |
+          CELL_PAD_CAPABILITY_HP_ANALOG_STICK |
+          CELL_PAD_CAPABILITY_ACTUATOR | CELL_PAD_CAPABILITY_SENSOR_MODE
+          ,
             CELL_PAD_DEV_TYPE_STANDARD, CELL_PAD_PCLASS_TYPE_STANDARD,
             pclass_profile, 0, 0, 50);
 
@@ -1709,6 +1709,50 @@ extern "C" bool _rpcsx_overlayPadData(int digital1, int digital2,
   pad->m_sticks[2].m_value = rightStickX;
   pad->m_sticks[3].m_value = rightStickY;
   return true;
+}
+
+extern "C" bool _rpcsx_setMotionData(float accelX, float accelY, float accelZ,
+                                     float gyroX, float gyroY, float gyroZ) {
+    auto pad = [] {
+        std::shared_ptr result;
+        std::lock_guard lock(g_virtual_pad_mutex);
+        result = g_virtual_pad;
+        return result;
+    }();
+
+    if (pad == nullptr) {
+        return false;
+    }
+
+    // Конвертация из float (физические единицы) в u16 (формат DS3: 0-1023)
+    // DS3 использует диапазон 0-1023, где 512 = центр (нет движения)
+    
+    // Акселерометр: диапазон ±2g (±19.6 m/s²)
+    // Конвертируем: -19.6 m/s² → 0, 0 m/s² → 512, +19.6 m/s² → 1023
+    auto convertAccel = [](float value) -> u16 {
+        float normalized = (value / 19.6f) * 512.0f + 512.0f;
+        return static_cast<u16>(std::clamp(normalized, 0.0f, 1023.0f));
+    };
+
+    // Гироскоп: диапазон ±2000°/s (±34.9 rad/s)
+    // Конвертируем: -34.9 rad/s → 0, 0 rad/s → 512, +34.9 rad/s → 1023
+    auto convertGyro = [](float value) -> u16 {
+        float normalized = (value / 34.9f) * 512.0f + 512.0f;
+        return static_cast<u16>(std::clamp(normalized, 0.0f, 1023.0f));
+    };
+
+    // Обновляем сенсоры виртуального геймпада
+    // m_sensors[0] = SENSOR_X (акселерометр X)
+    // m_sensors[1] = SENSOR_Y (акселерометр Y)
+    // m_sensors[2] = SENSOR_Z (акселерометр Z)
+    // m_sensors[3] = SENSOR_G (гироскоп)
+    
+    pad->m_sensors[0].m_value = convertAccel(accelX);
+    pad->m_sensors[1].m_value = convertAccel(accelY);
+    pad->m_sensors[2].m_value = convertAccel(accelZ);
+    pad->m_sensors[3].m_value = convertGyro(gyroX);  // Используем только X для гироскопа
+
+    return true;
 }
 
 extern "C" bool _rpcsx_initialize(std::string_view rootDir,
@@ -2639,6 +2683,14 @@ extern "C" void *_rpcsx_setCustomDriver(void *driverHandle) {
   }
 
   return prevLoader;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL 
+Java_net_rpcsx_RPCSX_setMotionData(
+    JNIEnv *, jobject, 
+    jfloat accelX, jfloat accelY, jfloat accelZ,
+    jfloat gyroX, jfloat gyroY, jfloat gyroZ) {
+    return _rpcsx_setMotionData(accelX, accelY, accelZ, gyroX, gyroY, gyroZ);
 }
 
 #pragma GCC diagnostic pop
