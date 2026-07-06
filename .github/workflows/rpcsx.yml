@@ -104,43 +104,6 @@ jobs:
         -DCMAKE_TOOLCHAIN_FILE=$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}/build/cmake/android.toolchain.cmake \
         -DCMAKE_BUILD_TYPE=Release -G Ninja
 
-    - name: Extract version info
-      id: version
-      run: |
-        # Читаем файл .rx.version
-        RX_VERSION=$(cat android/.rx.version | awk -F'-' '{print $1}')
-        RX_SHA=$(cat android/.rx.version | awk -F'-' '{print $5}')
-        
-        # Отладка: показываем что прочитали
-        echo "Raw RX_VERSION: '$RX_VERSION'"
-        echo "Raw RX_SHA: '$RX_SHA'"
-        
-        # Очищаем от пробелов и спецсимволов
-        RX_VERSION=$(echo "$RX_VERSION" | tr -d '[:space:]')
-        RX_SHA=$(echo "$RX_SHA" | tr -d '[:space:]')
-        
-        # Если SHA пустой, используем короткий SHA из git
-        if [ -z "$RX_SHA" ]; then
-          RX_SHA=$(git rev-parse --short HEAD)
-        fi
-        
-        # Ограничиваем SHA до 7 символов (как в оригинале)
-        RX_SHA="${RX_SHA:0:7}"
-        
-        # Формируем тег
-        TAG_NAME="v${RX_VERSION}-${RX_SHA}"
-        
-        # Проверяем валидность тега (только буквы, цифры, точки, дефисы, подчеркивания)
-        if [[ ! "$TAG_NAME" =~ ^v[0-9a-zA-Z._-]+$ ]]; then
-          echo "ERROR: Invalid tag name: '$TAG_NAME'"
-          exit 1
-        fi
-        
-        echo "Final TAG_NAME: '$TAG_NAME'"
-        echo "RX_VERSION=$RX_VERSION" >> "$GITHUB_ENV"
-        echo "RX_SHA=$RX_SHA" >> "$GITHUB_ENV"
-        echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
-
     - name: Build
       run: |
         $ANDROID_SDK_ROOT/cmake/${{ env.CMAKE_VERSION }}/bin/cmake --build build
@@ -170,21 +133,35 @@ jobs:
     - name: Extract version info
       id: version
       run: |
+        # Читаем .rx.version — формат: "20250706-0c1f8d4" или "20250706-0c1f8d4-..."
+        # Берём первую часть как дату, вторую как SHA
         RX_VERSION=$(cat android/.rx.version | awk -F'-' '{print $1}')
-        RX_SHA=$(cat android/.rx.version | awk -F'-' '{print $5}')
+        RX_SHA=$(cat android/.rx.version | awk -F'-' '{print $2}')
         
-        # Очищаем
+        # Очищаем от пробелов
         RX_VERSION=$(echo "$RX_VERSION" | tr -d '[:space:]')
         RX_SHA=$(echo "$RX_SHA" | tr -d '[:space:]')
         
+        # Fallback: если пусто, берём из git
+        if [ -z "$RX_VERSION" ]; then
+          RX_VERSION=$(date +%Y%m%d)
+        fi
         if [ -z "$RX_SHA" ]; then
           RX_SHA=$(git rev-parse --short HEAD)
         fi
+        
+        # Обрезаем SHA до 7 символов
         RX_SHA="${RX_SHA:0:7}"
         
+        # Тег: v20250706-0c1f8d4 (без ABI и архитектуры!)
         TAG_NAME="v${RX_VERSION}-${RX_SHA}"
         
-        echo "TAG_NAME: '$TAG_NAME'"
+        echo "RX_VERSION=$RX_VERSION"
+        echo "RX_SHA=$RX_SHA"
+        echo "TAG_NAME=$TAG_NAME"
+        
+        echo "rx_version=$RX_VERSION" >> "$GITHUB_OUTPUT"
+        echo "rx_sha=$RX_SHA" >> "$GITHUB_OUTPUT"
         echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
 
     - name: Download all artifacts
