@@ -1605,11 +1605,11 @@ static void setupCallbacks() {
 static bool initVirtualPad(const std::shared_ptr<Pad> &pad) {
   u32 pclass_profile = 0;
   pad->Init(CELL_PAD_STATUS_CONNECTED,
-          CELL_PAD_CAPABILITY_PS3_CONFORMITY |
-          CELL_PAD_CAPABILITY_PRESS_MODE |
-          CELL_PAD_CAPABILITY_HP_ANALOG_STICK |
-          CELL_PAD_CAPABILITY_ACTUATOR | CELL_PAD_CAPABILITY_SENSOR_MODE
-          ,
+            CELL_PAD_CAPABILITY_PS3_CONFORMITY |
+                CELL_PAD_CAPABILITY_PRESS_MODE |
+                CELL_PAD_CAPABILITY_HP_ANALOG_STICK |
+                CELL_PAD_CAPABILITY_ACTUATOR //| CELL_PAD_CAPABILITY_SENSOR_MODE
+            ,
             CELL_PAD_DEV_TYPE_STANDARD, CELL_PAD_PCLASS_TYPE_STANDARD,
             pclass_profile, 0, 0, 50);
 
@@ -1714,7 +1714,7 @@ extern "C" bool _rpcsx_overlayPadData(int digital1, int digital2,
 extern "C" bool _rpcsx_setMotionData(float accelX, float accelY, float accelZ,
                                      float gyroX, float gyroY, float gyroZ) {
     auto pad = [] {
-        std::shared_ptr result;
+        std::shared_ptr<Pad> result;
         std::lock_guard lock(g_virtual_pad_mutex);
         result = g_virtual_pad;
         return result;
