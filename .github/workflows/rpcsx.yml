@@ -21,13 +21,7 @@ jobs:
     - name: Setup dependencies
       run: |
         sudo apt update
-        sudo apt install -y cmake build-essential libunwind-dev \
-          libsox-dev g++-14 ninja-build libasound2-dev nasm libudev-dev \
-          libxcb1-dev libx11-dev libwayland-dev libxkbcommon-dev libxrandr-dev \
-          libxinerama-dev libxcursor-dev libxi-dev libxext-dev
-        cmake -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_INSTALL_PREFIX=/usr
-        cmake --build build -j$(($(nproc) + 2))
-        sudo cmake --build build
+        sudo apt install -y cmake build-essential libunwind-dev           libsox-dev g++-14 ninja-build libasound2-dev nasm libudev-dev           libxcb1-dev libx11-dev libwayland-dev libxkbcommon-dev libxrandr-dev           libxinerama-dev libxcursor-dev libxi-dev libxext-dev
 
     - name: Build RPCSX
       run: |
@@ -98,18 +92,14 @@ jobs:
 
     - name: Configure
       run: |
-        $ANDROID_SDK_ROOT/cmake/${{ env.CMAKE_VERSION }}/bin/cmake \
-        -B build -S android -DANDROID_ABI=${{ matrix.abi }} \
-        -DUSE_ARCH=${{ matrix.arch }} \
-        -DANDROID_PLATFORM=android-29 \
-        -DANDROID_NDK=$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }} \
-        -DCMAKE_TOOLCHAIN_FILE=$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}/build/cmake/android.toolchain.cmake \
-        -DCMAKE_BUILD_TYPE=Release -G Ninja
+        $ANDROID_SDK_ROOT/cmake/${{ env.CMAKE_VERSION }}/bin/cmake         -B build -S android -DANDROID_ABI=${{ matrix.abi }}         -DUSE_ARCH=${{ matrix.arch }}         -DANDROID_PLATFORM=android-29         -DANDROID_NDK=$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}         -DCMAKE_TOOLCHAIN_FILE=$ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}/build/cmake/android.toolchain.cmake         -DCMAKE_BUILD_TYPE=Release -G Ninja
 
-        RX_VERSION=`cat android/.rx.version | awk -F'-' '{print $1}'`
-        RX_SHA=`cat android/.rx.version | awk -F'-' '{print $5}'`
-        echo "RX_VERSION=$RX_VERSION" >> "${{ github.env }}"
-        echo "RX_SHA=$RX_SHA" >> "${{ github.env }}"
+    - name: Extract version info
+      run: |
+        RX_VERSION=$(cat android/.rx.version | awk -F'-' '{print $1}')
+        RX_SHA=$(cat android/.rx.version | awk -F'-' '{print $5}')
+        echo "RX_VERSION=$RX_VERSION" >> "$GITHUB_ENV"
+        echo "RX_SHA=$RX_SHA" >> "$GITHUB_ENV"
 
     - name: Build
       run: |
@@ -117,12 +107,9 @@ jobs:
         $ANDROID_SDK_ROOT/ndk/${{ env.NDK_VERSION }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip build/librpcsx-android.so
         mv build/librpcsx-android.so librpcsx-android-${{ matrix.abi }}-${{ matrix.arch }}.so
 
-        - name: Deploy build
+    - name: Deploy build
       uses: softprops/action-gh-release@v2
-      if: |
-        github.event_name != 'pull_request' &&
-        github.ref == 'refs/heads/master' &&
-        github.repository == 'Snap888/Rpcsx_test'
+      if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master' && github.repository == 'Snap888/Rpcsx_test'
       with:
         prerelease: false
         make_latest: true
@@ -135,4 +122,3 @@ jobs:
           Commit: ${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}
           ABI: ${{ matrix.abi }}
           Arch: ${{ matrix.arch }}
-
