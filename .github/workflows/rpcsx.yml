@@ -18,11 +18,6 @@ jobs:
       with:
         submodules: recursive
 
-    - name: Set swap space
-      uses: pierotofy/set-swap-space@master
-      with:
-        swap-size-gb: 10
-
     - name: Setup dependencies
       run: |
         sudo apt update
@@ -81,11 +76,6 @@ jobs:
         submodules: recursive
         fetch-depth: 0
         lfs: true
-
-    - name: Set swap space
-      uses: pierotofy/set-swap-space@master
-      with:
-        swap-size-gb: 10
 
     - name: Setup Java
       uses: actions/setup-java@v4
