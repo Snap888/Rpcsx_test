@@ -53,32 +53,35 @@
 #include "util/logs.hpp"
 #include "util/serialization.hpp"
 #include "util/sysinfo.hpp"
-#include <Emu/Io/pad_config.h>
-#include <Emu/RSX/GSFrameBase.h>
-#include <Emu/System.h>
-#include <nlohmann/json.hpp>
-#include <rpcsx/fw/ps3/cellSaveData.h>
-#include <rpcsx/fw/ps3/sceNpTrophy.h>
-#include <rx/Version.hpp>
-
 #include <algorithm>
-#include <android/log.h>
-#include <android/native_window.h>
-#include <android/native_window_jni.h>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <filesystem>
 #include <functional>
-#include <iterator>
-#include <jni.h>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
-#include <span>
+#include <queue>
+#include <ranges>
 #include <string>
-#include <sys/resource.h>
+#include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
+
+#include <android/asset_manager.h>
+#include <android/asset_manager_jni.h>
+#include <android/log.h>
+#include <android/native_window.h>
+#include <android/native_window_jni.h>
+#include <jni.h>
+#include <sys/resource.h>
+#include <sys/system_properties.h>
+#include <unistd.h>
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wreturn-type-c-linkage"
@@ -96,7 +99,7 @@ extern std::string g_android_config_dir;
 extern std::string g_android_cache_dir;
 
 static std::mutex g_virtual_pad_mutex;
-static std::shared_ptr<Pad> g_virtual_pad;
+static std::shared_ptr<virtual_pad_handler> g_virtual_pad;
 
 std::string g_input_config_override;
 cfg_input_configurations g_cfg_input_configs;
@@ -109,7 +112,7 @@ struct LogListener : logs::listener {
   void log(u64 stamp, const logs::message &msg, const std::string &prefix,
            const std::string &text) override {
     int prio = 0;
-    switch (static_cast<logs::level>(msg)) {
+    switch (static_cast<int>(msg)) {
     case logs::level::always:
       prio = ANDROID_LOG_INFO;
       break;
@@ -248,7 +251,7 @@ void jit_announce(uptr, usz, std::string_view);
 }
 
 void qt_events_aware_op(int repeat_duration_ms,
-                        std::function<bool()> wrapped_op) {
+                        std::function<void()> wrapped_op) {
   /// ?????
 }
 
@@ -285,21 +288,21 @@ enum class FileType {
 static FileType getFileType(const fs::file &file) {
   file.seek(0);
   if (PUPHeader pupHeader; file.read(pupHeader)) {
-    if (pupHeader.magic == "SCEUF\0\0\0"_u64) {
+    if (pupHeader.magic == "SCEUF000"_u64) {
       return FileType::Pup;
     }
   }
 
   file.seek(0);
   if (PKGHeader pkgHeader; file.read(pkgHeader)) {
-    if (pkgHeader.pkg_magic == std::bit_cast<le_t<u32>>("\x7FPKG"_u32)) {
+    if (pkgHeader.pkg_magic == std::bit_cast<u32, u32[2]>("x7FPKG"_u32)) {
       return FileType::Pkg;
     }
   }
 
   file.seek(0);
   if (NPD_HEADER npdHeader; file.read(npdHeader)) {
-    if (npdHeader.magic == "NPD\0"_u32) {
+    if (npdHeader.magic == "NPD0"_u32) {
       return FileType::Edat;
     }
   }
@@ -489,10 +492,10 @@ static std::pair<std::string, std::u32string> g_strings[] = {
     MAKE_STRING(HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_FRAMETIME_DETAIL_LEVEL,
                 "Frametime Graph Detail Level"),
     MAKE_STRING(
-        HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_FRAMERATE_DATAPOINT_COUNT,
+        HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_FRAMERATE_DATAPPOINT_COUNT,
         "Framerate Datapoints"),
     MAKE_STRING(
-        HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_FRAMETIME_DATAPOINT_COUNT,
+        HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_FRAMETIME_DATAPPOINT_COUNT,
         "Frametime Datapoints"),
     MAKE_STRING(HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_UPDATE_INTERVAL,
                 "Metrics Update Interval"),
@@ -609,7 +612,7 @@ public:
   void failure(const std::string &message = {}) { report(-1, 0, message); }
 
   void success(jlong value, const std::string &message = {}) {
-    value = std::max<jlong>(value, 1);
+    value = std::max(value, 1LL);
     report(value, value, message);
   }
 
@@ -635,10 +638,11 @@ static void sendFirmwareCompiled(JNIEnv *env, const std::string &version) {
 }
 
 static void sendGameInfo(JNIEnv *env, jlong progressId,
-                         std::span<const GameInfo> infos) {
+                         std::span<GameInfo> infos) {
   auto gameRepositoryClass = ensure(env->FindClass("net/rpcsx/GameRepository"));
   auto addMethodId = ensure(env->GetStaticMethodID(
       gameRepositoryClass, "add", "([Lnet/rpcsx/GameInfo;J)V"));
+
   auto gameClass = ensure(env->FindClass("net/rpcsx/GameInfo"));
 
   jmethodID gameConstructor = ensure(env->GetMethodID(
@@ -707,7 +711,7 @@ static bool tryUnlockGame(const psf::registry &psf) {
 static void collectGamePaths(std::vector<std::string> &paths,
                              const std::string &rootDir) {
   std::error_code ec;
-  std::vector<std::filesystem::path> workList;
+  std::vector<std::string> workList;
   workList.reserve(32);
   if (!std::filesystem::is_directory(rootDir)) {
     auto rootPath = std::filesystem::path(rootDir).parent_path();
@@ -837,7 +841,7 @@ fetchGameInfo(const psf::registry &psf,
 
     if (!ebootPath.empty()) {
       if (fs::file eboot{ebootPath};
-          eboot && eboot.size() >= 4 && eboot.read<u32>() == "SCE\0"_u32) {
+          eboot && eboot.size() >= 4 && eboot.read<u32>() == "SCE0"_u32) {
         isLocked = !decrypt_self(eboot);
       }
     }
@@ -936,23 +940,23 @@ static void collectGameInfo(JNIEnv *env, jlong progressId,
 class MainThreadProcessor {
   std::mutex mutex;
   std::condition_variable cv;
-  std::deque<std::pair<std::function<void(JNIEnv *)>, atomic_t<u32> *>> queue;
+  std::deque<std::pair<std::function<void(JNIEnv *)>, atomic_t<bool> *>> queue;
 
 public:
-  void push(std::function<void(JNIEnv *)> cb, atomic_t<u32> *wakeUp = nullptr) {
+  void push(std::function<void(JNIEnv *)> cb, atomic_t<bool> *wakeUp = nullptr) {
     std::lock_guard lock(mutex);
     queue.push_back({std::move(cb), wakeUp});
     cv.notify_one();
   }
 
-  void push(std::function<void()> cb, atomic_t<u32> *wakeUp = nullptr) {
-    push([cb = std::move(cb)](JNIEnv *) { cb(); }, wakeUp);
+  void push(std::function<void()> cb, atomic_t<bool> *wakeUp = nullptr) {
+    push([cb = std::move(cb)](JNIEnv *env) { cb(); }, wakeUp);
   }
 
   void process(JNIEnv *env) {
     while (true) {
       std::function<void(JNIEnv *)> cb;
-      atomic_t<u32> *wakeUp = nullptr;
+      atomic_t<bool> *wakeUp = nullptr;
 
       {
         std::unique_lock lock(mutex);
@@ -977,12 +981,12 @@ public:
   }
 } static g_mainThreadProcessor;
 
-static void invokeAsync(std::function<void(JNIEnv *)> cb) {
+static void invokeAsync(std::function<void()> cb) {
   g_mainThreadProcessor.push(std::move(cb));
 }
 
 static void invokeSync(std::function<void(JNIEnv *)> cb) {
-  atomic_t<u32> wakeup{false};
+  atomic_t<bool> wakeup{false};
   g_mainThreadProcessor.push(std::move(cb), &wakeup);
 
   while (wakeup.load() == false) {
@@ -1017,565 +1021,101 @@ struct ProgressMessageDialog : MsgDialogBase {
       progress.report(0, 0);
     });
 
-    //   Progress progress(env, progressId);
-    //   if (success) {
-    //     progress.success(0);
-    //   } else {
-    //     progress.failure();
-    //   }
-    // });
-  }
-
-  void SetMsg(const std::string &msg) override {
-    rpcsx_android.warning("ProgressMessageDialog::SetMsg(%s)", msg);
-    invokeSync([this, msg](JNIEnv *env) {
-      Progress(env, progressId).report(getValue(), max, msg);
-    });
-  }
-
-  void ProgressBarSetMsg(u32 progressBarIndex,
-                         const std::string &msg) override {
-    rpcsx_android.warning("ProgressMessageDialog::ProgressBarSetMsg(%d, %s)",
-                          progressBarIndex, msg);
-    if (progressBarIndex != 0) {
-      report_fatal_error("Unexpected progress index in progress dialog");
-    }
-
-    invokeSync([this, msg](JNIEnv *env) {
-      Progress(env, progressId).report(getValue(), max, msg);
-    });
-  }
-
-  void ProgressBarReset(u32 progressBarIndex) override {
-    rpcsx_android.warning("ProgressMessageDialog::ProgressBarReset(%d)",
-                          progressBarIndex);
-
-    if (progressBarIndex != 0) {
-      report_fatal_error("Unexpected progress index in progress dialog");
-    }
-
-    value = 0;
-    invokeSync(
-        [this](JNIEnv *env) { Progress(env, progressId).report(value, max); });
-  }
-
-  void ProgressBarInc(u32 progressBarIndex, u32 delta) override {
-    rpcsx_android.warning("ProgressMessageDialog::ProgressBarInc(%d, %d)",
-                          progressBarIndex, delta);
-
-    if (progressBarIndex != 0) {
-      report_fatal_error("Unexpected progress index in progress dialog");
-    }
-
-    value += delta;
-
-    invokeSync([this](JNIEnv *env) {
-      Progress(env, progressId).report(getValue(), max);
-    });
-  }
-
-  void ProgressBarSetValue(u32 progressBarIndex, u32 value) override {
-    rpcsx_android.warning("ProgressMessageDialog::ProgressBarSetValue(%d, %d)",
-                          progressBarIndex, value);
-
-    if (progressBarIndex != 0) {
-      report_fatal_error("Unexpected progress index in progress dialog");
-    }
-
-    this->value = value;
-
-    invokeSync([this](JNIEnv *env) {
-      Progress(env, progressId).report(getValue(), max);
-    });
-  }
-  void ProgressBarSetLimit(u32 index, u32 limit) override {
-    rpcsx_android.warning("ProgressMessageDialog::ProgressBarSetLimit(%d, %d)",
-                          index, limit);
-
-    if (index != 0) {
-      report_fatal_error("Unexpected progress index in progress dialog");
-    }
-
-    max = limit;
-
-    invokeSync([this](JNIEnv *env) {
-      Progress(env, progressId).report(getValue(), max);
-    });
+    // Progress progress(env, progressId);
+    // if (success) {
+    //   progress.success(0);
+    // } else {
+    //   progress.failure();
+    // }
   }
 };
 
-struct UiMessageDialog : MsgDialogBase {
-  // FIXME: implement
+struct JavaThreadScope {
+  JNIEnv *env;
+  JavaVM *jvm;
+  bool attached;
 
-  void Create(const std::string &msg, const std::string &title) override {}
-  void Close(bool success) override {}
-  void SetMsg(const std::string &msg) override {}
-  void ProgressBarSetMsg(u32 progressBarIndex,
-                         const std::string &msg) override {}
-  void ProgressBarReset(u32 progressBarIndex) override {}
-  void ProgressBarInc(u32 progressBarIndex, u32 delta) override {}
-  void ProgressBarSetValue(u32 progressBarIndex, u32 value) override {}
-  void ProgressBarSetLimit(u32 index, u32 limit) override {}
-};
+  JavaThreadScope() {
+    if (JNI_GetCreatedJavaVMs(&jvm, 1, nullptr) != JNI_OK) {
+      rpcsx_android.fatal("JNI_GetCreatedJavaVMs failed");
+      std::abort();
+    }
 
-struct MessageDialog : MsgDialogBase {
-  std::unique_ptr<MsgDialogBase> impl = nullptr;
-
-  void Create(const std::string &msg, const std::string &title) override {
-    auto progressId = s_pendingProgressId.load();
-
-    rpcsx_android.warning("MessageDialog::Create(%s, %s): source %s, id %d",
-                          msg, title, source, progressId);
-
-    if (progressId != -1) {
-      impl = std::make_unique<ProgressMessageDialog>(progressId);
+    jint result = jvm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6);
+    if (result == JNI_EDETACHED) {
+      if (jvm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+        rpcsx_android.fatal("AttachCurrentThread failed");
+        std::abort();
+      }
+      attached = true;
+    } else if (result == JNI_OK) {
+      attached = false;
     } else {
-      impl = std::make_unique<UiMessageDialog>();
-    }
-
-    impl->type = type;
-    impl->source = source;
-    impl->Create(msg, title);
-  }
-
-  void Close(bool success) override { impl->Close(success); }
-
-  void SetMsg(const std::string &msg) override { impl->SetMsg(msg); }
-
-  void ProgressBarSetMsg(u32 progressBarIndex,
-                         const std::string &msg) override {
-    impl->ProgressBarSetMsg(progressBarIndex, msg);
-  }
-
-  void ProgressBarReset(u32 progressBarIndex) override {
-    impl->ProgressBarReset(progressBarIndex);
-  }
-
-  void ProgressBarInc(u32 progressBarIndex, u32 delta) override {
-    impl->ProgressBarInc(progressBarIndex, delta);
-  }
-
-  void ProgressBarSetValue(u32 progressBarIndex, u32 value) override {
-    impl->ProgressBarSetValue(progressBarIndex, value);
-  }
-
-  void ProgressBarSetLimit(u32 index, u32 limit) override {
-    impl->ProgressBarSetLimit(index, limit);
-  }
-
-  static void pushPendingProgressId(jlong id) {
-    jlong value = -1;
-
-    while (!s_pendingProgressId.compare_exchange_weak(value, id)) {
-      s_pendingProgressId.wait(value);
-      value = -1;
+      rpcsx_android.fatal("GetEnv failed with %d", result);
+      std::abort();
     }
   }
 
-  static bool popPendingProgressId(jlong id) {
-    return s_pendingProgressId.compare_exchange_strong(id, -1);
-  }
-
-private:
-  static std::atomic<jlong> s_pendingProgressId;
-};
-
-struct OverlaySaveDialog : SaveDialogBase {
-  s32 ShowSaveDataList(const std::string &base_dir,
-                       std::vector<SaveDataEntry> &save_entries, s32 focused,
-                       u32 op, vm::ptr<CellSaveDataListSet> listSet,
-                       bool enable_overlay) override {
-    rpcsx_android.notice("ShowSaveDataList(save_entries=%d, focused=%d, "
-                         "op=0x%x, listSet=*0x%x, enable_overlay=%d)",
-                         save_entries.size(), focused, op, listSet,
-                         enable_overlay);
-
-    bool use_end = sysutil_send_system_cmd(CELL_SYSUTIL_DRAWING_BEGIN, 0) >= 0;
-
-    auto atExit = AtExit([&] {
-      if (use_end) {
-        sysutil_send_system_cmd(CELL_SYSUTIL_DRAWING_END, 0);
-      }
-    });
-
-    if (!use_end) {
-      rpcsx_android.error(
-          "ShowSaveDataList(): Not able to notify DRAWING_BEGIN callback "
-          "because one has already been sent!");
+  ~JavaThreadScope() {
+    if (attached) {
+      jvm->DetachCurrentThread();
     }
-
-    if (auto manager = g_fxo->try_get<rsx::overlays::display_manager>()) {
-      rpcsx_android.notice("ShowSaveDataList: Showing native UI dialog");
-
-      s32 result = manager->create<rsx::overlays::save_dialog>()->show(
-          base_dir, save_entries, focused, op, listSet, enable_overlay);
-
-      if (result != rsx::overlays::user_interface::selection_code::error) {
-        rpcsx_android.notice(
-            "ShowSaveDataList: Native UI dialog returned with selection %d",
-            result);
-
-        return result;
-      }
-
-      rpcsx_android.error("ShowSaveDataList: Native UI dialog returned error");
-    }
-
-    return -2;
   }
 };
-
-class OverlayTrophyNotification : public TrophyNotificationBase {
-public:
-  s32 ShowTrophyNotification(
-      const SceNpTrophyDetails &trophy,
-      const std::vector<uchar> &trophy_icon_buffer) override {
-    if (auto manager = g_fxo->try_get<rsx::overlays::display_manager>()) {
-      auto popup = std::make_shared<rsx::overlays::trophy_notification>();
-      return manager->add(popup, false)->show(trophy, trophy_icon_buffer);
-    }
-
-    return 0;
-  }
-};
-
-std::atomic<jlong> MessageDialog::s_pendingProgressId = -1;
-
-struct CompilationWorkload {
-  jlong progressId;
-  std::string path;
-};
-
-extern bool ppu_load_exec(const ppu_exec_object &, bool virtual_load,
-                          const std::string &, utils::serial * = nullptr);
-extern void spu_load_exec(const spu_exec_object &);
-extern void spu_load_rel_exec(const spu_rel_object &);
-extern void ppu_precompile(std::vector<std::string> &dir_queue,
-                           std::vector<ppu_module<lv2_obj> *> *loaded_prx);
-extern bool ppu_initialize(const ppu_module<lv2_obj> &, bool check_only = false,
-                           u64 file_size = 0);
-extern void ppu_finalize(const ppu_module<lv2_obj> &);
-extern bool ppu_load_rel_exec(const ppu_rel_object &);
-
-class CompilationQueue {
-  std::atomic<std::uint64_t> nextWorkTag{0};
-  std::uint64_t lastProcessedTag = 0;
-  std::mutex queueMutex;
-  std::deque<CompilationWorkload> queue;
-
-public:
-  void push(CompilationWorkload workload) {
-    {
-      std::lock_guard lock(queueMutex);
-      queue.push_back(std::move(workload));
-    }
-
-    nextWorkTag.fetch_add(1);
-  }
-
-  void push(Progress &progress, std::string path) {
-    progress.report(0, 0);
-
-    push({
-        .progressId = progress.getProgressId(),
-        .path = std::move(path),
-    });
-  }
-
-  void process(JNIEnv *env) {
-    while (true) {
-      auto nextWorkTagValue = nextWorkTag.load();
-
-      if (nextWorkTagValue == lastProcessedTag) {
-        nextWorkTag.wait(lastProcessedTag);
-      }
-
-      if (nextWorkTagValue == lastProcessedTag || queue.empty()) {
-        continue;
-      }
-
-      CompilationWorkload workload;
-
-      {
-        std::lock_guard lock(queueMutex);
-
-        if (queue.empty()) {
-          continue;
-        }
-
-        workload = std::move(queue.front());
-        queue.pop_front();
-      }
-
-      impl(env, std::move(workload));
-      lastProcessedTag++;
-    }
-  }
-
-private:
-  void impl(JNIEnv *env, CompilationWorkload workload) {
-    if (workload.path.empty()) {
-      Progress(env, workload.progressId).success(0);
-      return;
-    }
-
-    rpcsx_android.error("Creating cache initiated, state %d",
-                        (int)Emu.GetStatus(false));
-
-    while (true) {
-      auto state = Emu.GetStatus(false);
-
-      if (state == system_state::stopped || state == system_state::ready) {
-        break;
-      }
-
-      rpcsx_android.error("Creating cache wait, state %d", (int)state);
-      std::this_thread::sleep_for(std::chrono::seconds(1));
-    }
-
-    bool is_vsh = workload.path.ends_with("/vsh.self");
-
-    Emu.SetState(system_state::running);
-
-    MessageDialog::pushPendingProgressId(workload.progressId);
-
-    g_fxo->init<named_thread<progress_dialog_server>>();
-    g_fxo->init<main_ppu_module<lv2_obj>>();
-    g_fxo->init(false, nullptr);
-    auto rootPath = std::filesystem::path(workload.path);
-
-    if (is_vsh) {
-      rootPath = g_cfg_vfs.get_dev_flash() + "sys/external/";
-    } else {
-      if (!std::filesystem::is_directory(rootPath)) {
-        rootPath = rootPath.parent_path();
-        if (rootPath.filename() == "USRDIR") {
-          rootPath = rootPath.parent_path();
-        }
-      }
-    }
-
-    auto &_main = *ensure(g_fxo->try_get<main_ppu_module<lv2_obj>>());
-
-    if (fs::is_file(workload.path)) {
-      if (!is_vsh) {
-        auto sfoPath = locateParamSfoPath(std::string(rootPath));
-
-        if (!sfoPath.empty()) {
-          const auto psf = psf::load_object(sfoPath);
-          rpcsx_android.warning("title id is %s",
-                                psf::get_string(psf, "TITLE_ID"));
-
-          Emu.SetTitleID(std::string(psf::get_string(psf, "TITLE_ID")));
-        } else {
-          rpcsx_android.warning("param.sfo not found");
-        }
-      }
-
-      // Compile binary first
-      rpcsx_android.notice("Trying to load binary: %s", workload.path);
-
-      fs::file src{workload.path};
-      src = decrypt_self(src);
-
-      const ppu_exec_object obj = src;
-
-      if (obj == elf_error::ok && ppu_load_exec(obj, true, workload.path)) {
-        _main.path = workload.path;
-      } else {
-        rpcsx_android.error("Failed to load binary '%s' (%s)", workload.path,
-                            obj.get_error());
-      }
-    }
-
-    std::vector<std::string> dir_queue;
-    dir_queue.push_back(rootPath.string());
-
-    for (auto &entry :
-         std::filesystem::recursive_directory_iterator(rootPath)) {
-      if (entry.is_directory()) {
-        dir_queue.push_back(entry.path().string());
-      }
-    }
-
-    std::vector<ppu_module<lv2_obj> *> mod_list;
-    rpcsx_android.error("Going to analyze executable");
-
-    // FIXME: split states
-    if (!is_vsh) {
-      if (_main.analyse(0, _main.elf_entry, _main.seg0_code_end,
-                        _main.applied_patches, std::vector<u32>{})) {
-        Emu.ConfigurePPUCache();
-        Emu.SetTestMode();
-        rpcsx_android.error("Going to precompile main PPU module");
-        ppu_initialize(_main);
-        mod_list.emplace_back(&_main);
-      }
-    }
-
-    ppu_precompile(dir_queue, mod_list.empty() ? nullptr : &mod_list);
-
-    rpcsx_android.error("Finalization");
-    g_fxo->reset();
-    Emu.SetState(system_state::stopped);
-
-    MessageDialog::popPendingProgressId(workload.progressId);
-
-    Progress(env, workload.progressId).success(0);
-  }
-} static g_compilationQueue;
 
 static void setupCallbacks() {
   Emu.SetCallbacks({
-      .call_from_main_thread =
-          [](std::function<void()> cb, atomic_t<u32> *wake_up) {
-            cb();
-            if (wake_up) {
-              *wake_up = true;
-            }
-          },
-      .on_run = [](auto...) {},
-      .on_pause = [](auto...) {},
-      .on_resume = [](auto...) {},
-      .on_stop = [](auto...) {},
-      .on_ready = [](auto...) {},
-      .on_missing_fw = [](auto...) {},
-      .on_emulation_stop_no_response = [](auto...) {},
-      .on_save_state_progress = [](auto...) {},
-      .enable_disc_eject = [](auto...) {},
-      .enable_disc_insert = [](auto...) {},
-      .handle_taskbar_progress = [](auto...) {},
-      .init_kb_handler =
-          [](auto...) {
-            ensure(g_fxo->init<KeyboardHandlerBase, NullKeyboardHandler>(
-                Emu.DeserialManager()));
-          },
-      .init_mouse_handler =
-          [](auto...) {
-            ensure(g_fxo->init<MouseHandlerBase, NullMouseHandler>(
-                Emu.DeserialManager()));
-          },
-      .init_pad_handler =
-          [](auto...) {
-            ensure(g_fxo->init<named_thread<pad_thread>>(nullptr, nullptr, ""));
-          },
-      .update_emu_settings = [](auto...) {},
-      .save_emu_settings =
-          [](auto...) {
-            Emulator::SaveSettings(g_cfg.to_string(), Emu.GetTitleID());
-          },
-      .close_gs_frame = [](auto...) {},
-      .get_gs_frame = [] { return std::make_unique<GraphicsFrame>(); },
-      .get_camera_handler =
-          [](auto...) { return std::make_shared<null_camera_handler>(); },
-      .get_music_handler =
-          [](auto...) { return std::make_shared<null_music_handler>(); },
-      .create_pad_handler = [](pad_handler type, void *thread, void *window)
-          -> std::shared_ptr<PadHandlerBase> {
-        switch (type) {
-        case pad_handler::keyboard:
-        case pad_handler::null:
+      .get_audio = []() -> std::shared_ptr<AudioBackend> {
+        std::shared_ptr<AudioBackend> result;
+
+        switch (g_cfg.audio.renderer.get()) {
+        case audio_renderer::null:
+          result = std::make_shared<NullAudioBackend>();
           break;
-        case pad_handler::ds3:
-          return std::make_shared<ds3_pad_handler>();
-        case pad_handler::ds4:
-          return std::make_shared<ds4_pad_handler>();
-        case pad_handler::dualsense:
-          return std::make_shared<dualsense_pad_handler>();
-        case pad_handler::skateboard:
-          //   return std::make_shared<skateboard_pad_handler>();
+
+        case audio_renderer::cubeb:
+        default:
+          result = std::make_shared<CubebBackend>();
           break;
-        case pad_handler::move:
-          // return std::make_shared<ps_move_handler>();
-          break;
-#ifdef _WIN32
-        case pad_handler::xinput:
-          return std::make_shared<xinput_pad_handler>();
-        case pad_handler::mm:
-          return std::make_shared<mm_joystick_handler>();
-#endif
-#ifdef HAVE_SDL3
-        case pad_handler::sdl:
-          return std::make_shared<sdl_pad_handler>();
-#endif
-#ifdef HAVE_LIBEVDEV
-        case pad_handler::evdev:
-          return std::make_shared<evdev_joystick_handler>();
-#endif
-        case pad_handler::virtual_pad:
-          return std::make_shared<virtual_pad_handler>();
         }
 
-        return std::make_shared<NullPadHandler>();
+        if (!result->Initialized()) {
+          rpcsx_android.error(
+              "Audio renderer %s could not be initialized, using a Null "
+              "renderer instead. Make sure that no other application is "
+              "running that might block audio access (e.g. Netflix).",
+              result->GetName());
+          result = std::make_shared<NullAudioBackend>();
+        }
+        return result;
       },
-      .init_gs_render =
-          [](utils::serial *ar) {
-            switch (g_cfg.video.renderer.get()) {
-            case video_renderer::null:
-              g_fxo->init<rsx::thread, named_thread<NullGSRender>>(ar);
-              break;
-            case video_renderer::vulkan:
-              g_fxo->init<rsx::thread, named_thread<VKGSRender>>(ar);
-              break;
-
-            default:
-              break;
-            }
-          },
-      .get_audio =
-          [](auto...) {
-            std::shared_ptr<AudioBackend> result;
-
-            switch (g_cfg.audio.renderer.get()) {
-            case audio_renderer::null:
-              result = std::make_shared<NullAudioBackend>();
-              break;
-
-            case audio_renderer::cubeb:
-            default:
-              result = std::make_shared<CubebBackend>();
-              break;
-            }
-
-            if (!result->Initialized()) {
-              rpcsx_android.error(
-                  "Audio renderer %s could not be initialized, using a Null "
-                  "renderer instead. Make sure that no other application is "
-                  "running that might block audio access (e.g. Netflix).",
-                  result->GetName());
-              result = std::make_shared<NullAudioBackend>();
-            }
-            return result;
-          },
-      .get_audio_enumerator = [](auto...) { return nullptr; },
-      .get_msg_dialog = [] { return std::make_shared<MessageDialog>(); },
-      .get_osk_dialog = [](auto...) { return nullptr; },
+      .get_audio_enumerator = [](u64) -> std::vector<AudioDevice> { return nullptr; },
+      .get_msg_dialog = [] { return std::make_shared<ProgressMessageDialog>(-1); },
+      .get_osk_dialog = [](bool) -> std::unique_ptr<OskDialogBase> { return nullptr; },
       .get_save_dialog =
-          [](auto...) { return std::make_unique<OverlaySaveDialog>(); },
-      .get_sendmessage_dialog = [](auto...) { return nullptr; },
-      .get_recvmessage_dialog = [](auto...) { return nullptr; },
+          [] { return std::make_unique<overlay_save_dialog>(); },
+      .get_sendmessage_dialog = [](bool) -> std::unique_ptr<SendMessageDialogBase> { return nullptr; },
+      .get_recvmessage_dialog = [](bool) -> std::unique_ptr<RecvMessageDialogBase> { return nullptr; },
       .get_trophy_notification_dialog =
-          [](auto...) { return std::make_unique<OverlayTrophyNotification>(); },
-      .get_localized_string = [](localized_string_id id,
-                                 const char *) -> std::string {
+          [] { return std::make_unique<overlay_trophy_notification_dialog>(); },
+      .get_localized_string = [](localized_string_id id) -> std::string {
         if (std::size_t(id) < std::size(g_strings)) {
           return g_strings[int(id)].first;
         }
         return "";
       },
-      .get_localized_u32string = [](localized_string_id id,
-                                    const char *) -> std::u32string {
+      .get_localized_u32string = [](localized_string_id id) -> std::u32string {
         if (std::size_t(id) < std::size(g_strings)) {
           return g_strings[int(id)].second;
         }
         return U"";
       },
-      .get_localized_setting = [](auto...) { return ""; },
-      .play_sound = [](auto...) {},
-      .get_image_info = [](auto...) { return false; },
-      .get_scaled_image = [](auto...) { return false; },
+      .get_localized_setting = [](localized_string_id) { return ""; },
+      .play_sound = [](const std::string &) {},
+      .get_image_info = [](const std::string &, s32, s32, bool, bool) -> bool { return false; },
+      .get_scaled_image = [](const std::string &, s32, s32, bool, bool, std::vector<u8> &, s32 &) -> bool { return false; },
       .resolve_path =
-          [](std::string_view arg) {
+          [](std::string_view arg) -> std::string {
             std::error_code ec;
             auto result =
                 std::filesystem::weakly_canonical(
@@ -1583,9 +1123,9 @@ static void setupCallbacks() {
                     .string();
             return ec ? std::string(arg) : result;
           },
-      .get_font_dirs = [](auto...) { return std::vector<std::string>(); },
+      .get_font_dirs = [] { return std::vector<std::string>(); },
       .on_install_pkgs =
-          [](const std::vector<std::string> &pkgs) {
+          [](const std::vector<std::string> &pkgs) -> bool {
             for (const std::string &pkg : pkgs) {
               if (!rpcs3::utils::install_pkg(pkg)) {
                 rpcsx_android.error("cd install pkgs: failed to install %s",
@@ -1595,14 +1135,14 @@ static void setupCallbacks() {
             }
             return true;
           },
-      .add_breakpoint = [](auto...) {},
-      .display_sleep_control_supported = [](auto...) { return false; },
-      .enable_display_sleep = [](auto...) {},
-      .check_microphone_permissions = [](auto...) {},
+      .add_breakpoint = [](u32) {},
+      .display_sleep_control_supported = [] { return false; },
+      .enable_display_sleep = [](bool) {},
+      .check_microphone_permissions = [](JNIEnv *) {},
   });
 }
 
-static bool initVirtualPad(const std::shared_ptr<Pad> &pad) {
+static bool initVirtualPad(const std::shared_ptr<virtual_pad_handler> &pad) {
   u32 pclass_profile = 0;
   pad->Init(CELL_PAD_STATUS_CONNECTED,
             CELL_PAD_CAPABILITY_PS3_CONFORMITY |
@@ -1613,39 +1153,39 @@ static bool initVirtualPad(const std::shared_ptr<Pad> &pad) {
             CELL_PAD_DEV_TYPE_STANDARD, CELL_PAD_PCLASS_TYPE_STANDARD,
             pclass_profile, 0, 0, 50);
 
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u16>{},
                               CELL_PAD_CTRL_UP);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u16>{},
                               CELL_PAD_CTRL_DOWN);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u16>{},
                               CELL_PAD_CTRL_LEFT);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u16>{},
                               CELL_PAD_CTRL_RIGHT);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u16>{},
                               CELL_PAD_CTRL_CROSS);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u16>{},
                               CELL_PAD_CTRL_SQUARE);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u16>{},
                               CELL_PAD_CTRL_CIRCLE);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u16>{},
                               CELL_PAD_CTRL_TRIANGLE);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u16>{},
                               CELL_PAD_CTRL_L1);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u16>{},
                               CELL_PAD_CTRL_L2);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u16>{},
                               CELL_PAD_CTRL_L3);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u16>{},
                               CELL_PAD_CTRL_R1);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL2, std::set<u16>{},
                               CELL_PAD_CTRL_R2);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u16>{},
                               CELL_PAD_CTRL_R3);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u16>{},
                               CELL_PAD_CTRL_START);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u16>{},
                               CELL_PAD_CTRL_SELECT);
-  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u32>{},
+  pad->m_buttons.emplace_back(CELL_PAD_BTN_OFFSET_DIGITAL1, std::set<u16>{},
                               CELL_PAD_CTRL_PS);
 
   pad->m_sticks[0] = AnalogStick(CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X, {}, {});
@@ -1675,9 +1215,8 @@ static bool initVirtualPad(const std::shared_ptr<Pad> &pad) {
 extern "C" bool _rpcsx_overlayPadData(int digital1, int digital2,
                                       int leftStickX, int leftStickY,
                                       int rightStickX, int rightStickY) {
-
   auto pad = [] {
-    std::shared_ptr<Pad> result;
+    std::shared_ptr<virtual_pad_handler> result;
     std::lock_guard lock(g_virtual_pad_mutex);
     result = g_virtual_pad;
     return result;
@@ -1711,13 +1250,13 @@ extern "C" bool _rpcsx_overlayPadData(int digital1, int digital2,
   return true;
 }
 
-// ============================================
-// Motion Controls - отправка данных гироскопа и акселерометра
-// ============================================
+// ==========================================
+// НОВАЯ ФУНКЦИЯ: Передача данных движения (Motion Data)
+// ==========================================
 extern "C" bool _rpcsx_setMotionData(float accelX, float accelY, float accelZ,
                                      float gyroX, float gyroY, float gyroZ) {
     auto pad = [] {
-        std::shared_ptr<Pad> result;
+        std::shared_ptr<virtual_pad_handler> result;
         std::lock_guard lock(g_virtual_pad_mutex);
         result = g_virtual_pad;
         return result;
@@ -1727,29 +1266,16 @@ extern "C" bool _rpcsx_setMotionData(float accelX, float accelY, float accelZ,
         return false;
     }
 
-    // Конвертация из float (физические единицы) в u16 (формат DS3: 0-1023)
-    // DS3 использует диапазон 0-1023, где 512 = центр (нет движения)
-    
-    // Акселерометр: диапазон ±2g (±19.6 m/s²)
-    // Конвертируем: -19.6 m/s² → 0, 0 m/s² → 512, +19.6 m/s² → 1023
     auto convertAccel = [](float value) -> u16 {
         float normalized = (value / 19.6f) * 512.0f + 512.0f;
         return static_cast<u16>(std::clamp(normalized, 0.0f, 1023.0f));
     };
 
-    // Гироскоп: диапазон ±2000°/s (±34.9 rad/s)
-    // Конвертируем: -34.9 rad/s → 0, 0 rad/s → 512, +34.9 rad/s → 1023
     auto convertGyro = [](float value) -> u16 {
         float normalized = (value / 34.9f) * 512.0f + 512.0f;
         return static_cast<u16>(std::clamp(normalized, 0.0f, 1023.0f));
     };
 
-    // Обновляем сенсоры виртуального геймпада
-    // m_sensors[0] = SENSOR_X (акселерометр X)
-    // m_sensors[1] = SENSOR_Y (акселерометр Y)
-    // m_sensors[2] = SENSOR_Z (акселерометр Z)
-    // m_sensors[3] = SENSOR_G (гироскоп)
-    
     pad->m_sensors[0].m_value = convertAccel(accelX);
     pad->m_sensors[1].m_value = convertAccel(accelY);
     pad->m_sensors[2].m_value = convertAccel(accelZ);
@@ -1757,7 +1283,6 @@ extern "C" bool _rpcsx_setMotionData(float accelX, float accelY, float accelZ,
 
     return true;
 }
-// ============================================
 
 extern "C" bool _rpcsx_initialize(std::string_view rootDir,
                                   std::string_view user) {
@@ -1788,7 +1313,7 @@ extern "C" bool _rpcsx_initialize(std::string_view rootDir,
   }
 
   // Initialize thread pool finalizer // ???
-  static_cast<void>(named_thread("", [](int) {}));
+  static_cast<void>(named_thread<void>("", [] {}));
 
   static std::unique_ptr<logs::listener> log_file;
   {
@@ -1831,14 +1356,14 @@ extern "C" bool _rpcsx_initialize(std::string_view rootDir,
   logs::set_init(
       {std::move(ver), std::move(sys), std::move(os), std::move(time)});
 
-  auto set_rlim = [](int resource, std::uint64_t limit) {
+  auto set_rlim = [](int resource, rlim64_t limit) {
     rlimit64 rlim{};
     if (getrlimit64(resource, &rlim) != 0) {
       rpcsx_android.error("failed to get rlimit for %d", resource);
       return;
     }
 
-    rlim.rlim_cur = std::min<std::size_t>(rlim.rlim_max, limit);
+    rlim.rlim_cur = std::min<rlim64_t>(rlim.rlim_max, limit);
     rpcsx_android.error("rlimit[%d] = %u (requested %u, max %u)", resource,
                         rlim.rlim_cur, limit, rlim.rlim_max);
 
@@ -1986,8 +1511,9 @@ extern "C" bool _rpcsx_usbDeviceEvent(int fd, int vendorId, int productId,
     auto selectedHandler = g_cfg_input.player1.handler.get();
     std::string selectedDevice;
 
-    std::map<pad_handler, std::pair<std::unique_ptr<PadHandlerBase>,
-                                    std::vector<std::string>>>
+    std::map<pad_handler,
+             std::pair<std::unique_ptr<PadHandlerBase>,
+                       std::vector<std::string>>>
         handlerToDevices;
 
     auto collectDevices = [&]<typename T>(T handler) {
@@ -2092,8 +1618,8 @@ static bool installPup(JNIEnv *env, fs::file &&pup_f, jlong progressId) {
   update_filenames.erase(std::remove_if(update_filenames.begin(),
                                         update_filenames.end(),
                                         [](const std::string &s) {
-                                          return !s.starts_with("dev_flash_");
-                                        }),
+    return !s.starts_with("dev_flash_");
+  }),
                          update_filenames.end());
 
   if (update_filenames.empty()) {
@@ -2188,7 +1714,7 @@ static bool installPkg(JNIEnv *env, fs::file &&file, jlong progressId) {
   }};
 
   package_install_result result = {};
-  named_thread worker("PKG Installer", [&readers, &result, &bootable_paths] {
+  named_thread worker("PKG Installer", [&, &readers, &result, &bootable_paths] {
     result = package_reader::extract_data(readers, bootable_paths);
     return result.error == package_install_result::error_type::no_error;
   });
@@ -2688,17 +2214,5 @@ extern "C" void *_rpcsx_setCustomDriver(void *driverHandle) {
 
   return prevLoader;
 }
-
-// ============================================
-// JNI обёртка для Motion Controls
-// ============================================
-extern "C" JNIEXPORT jboolean JNICALL 
-Java_net_rpcsx_RPCSX_setMotionData(
-    JNIEnv *, jobject, 
-    jfloat accelX, jfloat accelY, jfloat accelZ,
-    jfloat gyroX, jfloat gyroY, jfloat gyroZ) {
-    return _rpcsx_setMotionData(accelX, accelY, accelZ, gyroX, gyroY, gyroZ);
-}
-// ============================================
 
 #pragma GCC diagnostic pop
