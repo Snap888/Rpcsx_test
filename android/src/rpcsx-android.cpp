@@ -117,8 +117,7 @@ struct LogListener : logs::listener {
  void log(u64 stamp, const logs::message &msg, const std::string &prefix,
  const std::string &text) override {
  int prio = 0;
- logs::level level = msg;  // ✅ ИСПРАВЛЕНО: конвертируем в logs::level, не в int
- switch (level) {
+ switch (static_cast<int>(msg)) {
  case logs::level::always:
  prio = ANDROID_LOG_INFO;
  break;
@@ -241,13 +240,13 @@ void jit_announce(uptr, usz, std::string_view);
  fmt::append(buf, "\nEmulation is stopped");
  } else {
  const std::string &name = Emu.GetTitleAndTitleID();
- fmt::append(buf, "\nTitle: \"{}\" (emulation is {})",
+ fmt::append(buf, "\nTitle: \"%s\" (emulation is %s)",
  name.empty() ? "N/A" : name.data(),
  state == system_state::stopping ? "stopping" : "running");
  }
 
- fmt::append(buf, "\nBuild: \"{}\"", rpcs3::get_verbose_version());
- fmt::append(buf, "\nDate: \"{}\"", std::chrono::system_clock::now());
+ fmt::append(buf, "\nBuild: \"%s\"", rpcs3::get_verbose_version());
+ fmt::append(buf, "\nDate: \"%s\"", std::chrono::system_clock::now());
 
  __android_log_write(ANDROID_LOG_FATAL, "RPCS3", buf.c_str());
 
@@ -302,7 +301,7 @@ static FileType getFileType(const fs::file &file) {
 
  file.seek(0);
  if (PKGHeader pkgHeader; file.read(pkgHeader)) {
- if (pkgHeader.pkg_magic == std::bit_cast<u32, u32[2]>("x7FPKG"_u32)) {
+ if (pkgHeader.pkg_magic == std::bit_cast<u32>("x7FPKG"_u32)) {
  return FileType::Pkg;
  }
  }
@@ -327,7 +326,7 @@ static FileType getFileType(const fs::file &file) {
 
 #define MAKE_STRING(id, x) [int(localized_string_id::id)] = {x, U##x}
 
-static std::pair<std::string, std::u32string> g_strings[] = {
+static std::pair<const char *, const char32_t *> g_strings[] = {
  MAKE_STRING(RSX_OVERLAYS_COMPILING_SHADERS, "Compiling shaders"),
  MAKE_STRING(RSX_OVERLAYS_COMPILING_PPU_MODULES, "Compiling PPU Modules"),
  MAKE_STRING(RSX_OVERLAYS_MSG_DIALOG_YES, "Yes"),
@@ -499,10 +498,10 @@ static std::pair<std::string, std::u32string> g_strings[] = {
  MAKE_STRING(HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_FRAMETIME_DETAIL_LEVEL,
  "Frametime Graph Detail Level"),
  MAKE_STRING(
- HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_FRAMERATE_DATAPPOINT_COUNT,
+ HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_FRAMERATE_DATAPOINT_COUNT,
  "Framerate Datapoints"),
  MAKE_STRING(
- HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_FRAMETIME_DATAPPOINT_COUNT,
+ HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_FRAMETIME_DATAPOINT_COUNT,
  "Frametime Datapoints"),
  MAKE_STRING(HOME_MENU_SETTINGS_PERFORMANCE_OVERLAY_UPDATE_INTERVAL,
  "Metrics Update Interval"),
@@ -619,7 +618,7 @@ public:
  void failure(const std::string &message = {}) { report(-1, 0, message); }
 
  void success(jlong value, const std::string &message = {}) {
- value = std::max<jlong>(value, 1LL);  // ✅ ИСПРАВЛЕНО: явный тип jlong
+ value = std::max(value, 1LL);
  report(value, value, message);
  }
 
@@ -645,7 +644,7 @@ static void sendFirmwareCompiled(JNIEnv *env, const std::string &version) {
 }
 
 static void sendGameInfo(JNIEnv *env, jlong progressId,
- std::span<GameInfo> infos) {
+ std::span<const GameInfo> infos) {
  auto gameRepositoryClass = ensure(env->FindClass("net/rpcsx/GameRepository"));
  auto addMethodId = ensure(env->GetStaticMethodID(
  gameRepositoryClass, "add", "([Lnet/rpcsx/GameInfo;J)V"));
@@ -728,209 +727,200 @@ static void collectGamePaths(std::vector<std::string> &paths,
  if (rootPath.filename() == "PS3_GAME") {
  rootPath = rootPath.parent_path();
  }
- workList.push_back(rootPath);
+
+ workList.push_back(rootPath.string());
  } else {
  workList.push_back(rootDir);
  }
 
  while (!workList.empty()) {
- auto dir = std::move(workList.back());
+ auto currentPath = std::move(workList.back());
  workList.pop_back();
- for (auto &entry : std::filesystem::directory_iterator(dir, ec)) {
- if (entry.is_directory()) {
- if (entry.path().filename() != "C00") {
- workList.push_back(entry.path());
- }
+
+ fs::dir dir;
+ dir.reset(fs::open_dir(currentPath));
+
+ if (!dir) {
  continue;
  }
- if (entry.is_regular_file() && entry.path().filename() == "PARAM.SFO") {
- paths.push_back(entry.path().parent_path().string());
+
+ for (auto &entry : dir) {
+ if (entry.name == "." || entry.name == "..") {
  continue;
  }
+ if (entry.name == "PS3_UPDATE") {
+ continue;
+ }
+
+ if (entry.is_directory) {
+ workList.push_back(currentPath + "/" + entry.name);
+ } else if (entry.name == "PARAM.SFO") {
+ paths.push_back(currentPath);
+ break;
+ }
  }
  }
 }
 
-static std::string locateEbootPath(std::string_view root) {
- if (std::filesystem::is_regular_file(root)) {
- return std::string(root);
+static std::string locateEbootPath(const std::string &rootPath) {
+ const auto gameDir = rootPath + "/PS3_GAME";
+ const auto ebootPath = gameDir + "/USRDIR/EBOOT.BIN";
+
+ if (std::filesystem::is_regular_file(ebootPath)) {
+ return ebootPath;
  }
 
- for (auto suffix : {
- "/EBOOT.BIN",
- "/USRDIR/EBOOT.BIN",
- "/USRDIR/ISO.BIN.EDAT",
- "/PS3_GAME/USRDIR/EBOOT.BIN",
- }) {
- auto tryPath = std::string(root);
- tryPath += suffix;
- if (std::filesystem::is_regular_file(tryPath)) {
- return tryPath;
- }
+ const auto ebootPathAlt = rootPath + "/EBOOT.BIN";
+ if (std::filesystem::is_regular_file(ebootPathAlt)) {
+ return ebootPathAlt;
  }
 
  return {};
 }
 
-static std::string locateParamSfoPath(std::string_view root) {
- if (std::filesystem::is_regular_file(root)) {
- return std::string(root);
+static std::string locateParamSfoPath(const std::string &rootPath) {
+ const auto sfoPath = rootPath + "/PS3_GAME/PARAM.SFO";
+ if (std::filesystem::is_regular_file(sfoPath)) {
+ return sfoPath;
  }
 
- for (auto suffix : {
- "/PARAM.SFO",
- "/PS3_GAME/PARAM.SFO",
- }) {
- auto tryPath = std::string(root);
- tryPath += suffix;
- if (std::filesystem::is_regular_file(tryPath)) {
- return tryPath;
- }
+ const auto sfoPathAlt = rootPath + "/PARAM.SFO";
+ if (std::filesystem::is_regular_file(sfoPathAlt)) {
+ return sfoPathAlt;
  }
 
  return {};
 }
 
-static std::optional<GameInfo>
-fetchGameInfo(const psf::registry &psf,
- std::filesystem::path psfRootPath = {}) {
- auto titleId = std::string(psf::get_string(psf, "TITLE_ID"));
- auto name = std::string(psf::get_string(psf, "TITLE"));
- auto bootable = psf::get_integer(psf, "BOOTABLE", 0);
- auto category = psf::get_string(psf, "CATEGORY");
+static std::optional<GameInfo> fetchGameInfo(const psf::registry &psf) {
+ GameInfo result;
 
- if (!bootable || titleId.empty()) {
- return {};
- }
+ result.name = psf::get_string(psf, "TITLE", "Unknown");
 
- bool isDiscGame = category == "DG";
- std::string path;
-
- if (!isDiscGame) {
- path = rpcs3::utils::get_hdd0_dir() + "game/" + titleId + "/";
- } else {
- if (psfRootPath.empty()) {
- path = fs::get_config_dir() + "games/" + titleId + "/";
- } else {
- // Locate game root path
- if (psfRootPath.filename() == "USRDIR") {
- psfRootPath = psfRootPath.parent_path();
- }
- if (psfRootPath.filename() == "PS3_GAME") {
- psfRootPath = psfRootPath.parent_path();
- }
- path = psfRootPath;
- if (!path.ends_with('/')) {
- path += '/';
- }
- }
+ const auto contentId = psf::get_string(psf, "CONTENT_ID");
+ if (!contentId.empty()) {
+ const auto titleId = contentId.substr(7, 9);
+ result.path = fmt::format("%sgame/%s/", rpcs3::utils::get_hdd0_dir(),
+ titleId);
  }
 
- auto dataPath = isDiscGame ? path + "PS3_GAME/" : path;
- auto iconPath = dataPath + "ICON0.PNG";
- auto moviePath = dataPath + "ICON1.PAM";
- int flags = 0;
+ const auto bootable = psf::get_integer(psf, "BOOTABLE", 0);
+ const auto category = psf::get_string(psf, "CATEGORY");
 
- if (!isDiscGame) {
- auto ebootPath = locateEbootPath(path);
- bool isLocked = false;
- if (!ebootPath.empty()) {
- if (fs::file eboot{ebootPath};
- eboot && eboot.size() >= 4 && eboot.read<u32>() == "SCE0"_u32) {
- isLocked = !decrypt_self(eboot);
- }
- }
- if (isLocked) {
- flags |= kGameFlagLocked;
- rpcsx_android.warning("game %s is locked", path);
+ if (category == "DG" || category == "HG" || category == "HD") {
+ result.iconPath = locateParamSfoPath(result.path) + "/../ICON0.PNG";
  }
 
- auto c00Path = path + "/C00";
- bool isTrial = std::filesystem::is_directory(c00Path);
- if (isTrial) {
- if (!tryUnlockGame(psf)) {
- flags |= kGameFlagTrial;
- rpcsx_android.warning("game %s is trial", path);
- } else {
- auto c00IconPath = c00Path + "/ICON0.PNG";
- if (std::filesystem::is_regular_file(c00IconPath)) {
- iconPath = c00IconPath;
+ if (bootable) {
+ return result;
  }
 
- auto c00SfoPath = c00Path + "/PARAM.SFO";
- if (std::filesystem::is_regular_file(c00IconPath)) {
- auto c00Sfo = psf::load_object(c00SfoPath);
- titleId = psf::get_string(c00Sfo, "TITLE_ID", titleId);
- name = psf::get_string(c00Sfo, "TITLE", name);
- }
- }
- }
+ return std::nullopt;
+}
+
+static std::optional<GameInfo> fetchGameInfo(const fs::file &sfo_file) {
+ if (!sfo_file) {
+ return std::nullopt;
  }
 
- return GameInfo{
- .path = std::move(path),
- .name = std::move(name),
- .iconPath = std::move(iconPath),
- .flags = flags,
- };
+ auto psf = psf::load_object(sfo_file);
+ return fetchGameInfo(psf);
 }
 
 static void collectGameInfo(JNIEnv *env, jlong progressId,
- const std::vector<std::string> &rootDirs) {
- std::vector<std::string> paths;
- for (auto &&rootDir : rootDirs) {
- collectGamePaths(paths, rootDir);
+ std::span<std::string> rootDirs) {
+ std::vector<std::string> allPaths;
+ for (const auto &rootDir : rootDirs) {
+ collectGamePaths(allPaths, rootDir);
  }
 
  Progress progress(env, progressId);
- progress.report(0, paths.size());
+ progress.report(0, allPaths.size());
 
  jlong processed = 0;
- for (auto &&rootPath : paths) {
+ for (const auto &rootPath : allPaths) {
  auto sfoPath = locateParamSfoPath(rootPath);
  if (sfoPath.empty()) {
  continue;
  }
 
- auto psf = psf::load_object(sfoPath);
- if (auto gameInfo = fetchGameInfo(psf, rootPath)) {
+ fs::file sfo_file;
+ sfo_file.reset(fs::open_file(sfoPath, fs::read));
+
+ if (auto gameInfo = fetchGameInfo(sfo_file)) {
  sendGameInfo(env, progressId, {{*gameInfo}});
  }
 
- progress.report(++processed, paths.size());
+ progress.report(++processed, allPaths.size());
  }
 }
 
-static bool initVirtualPad(const std::shared_ptr<virtual_pad_handler> &pad) {
- pad->Init();  // ✅ В этом API Init() не принимает аргументов
+// ✅ ИСПРАВЛЕНО: Правильная инициализация virtual_pad_handler
+static bool initVirtualPad(const std::shared_ptr<virtual_pad_handler> &handler) {
+ // Получаем доступ к bindings через метод bindings()
+ auto& bindings = handler->bindings();
+ if (bindings.empty()) {
+ return false;
+ }
+ 
+ auto pad = bindings[0].pad;
+ if (!pad) {
+ return false;
+ }
+ 
+ // ✅ Вызываем Init на объекте Pad, а не на virtual_pad_handler
+ pad->Init(CELL_PAD_STATUS_CONNECTED,
+  CELL_PAD_CAPABILITY_PS3_CONFORMITY |
+  CELL_PAD_CAPABILITY_PRESS_MODE |
+  CELL_PAD_CAPABILITY_HP_ANALOG_STICK |
+  CELL_PAD_CAPABILITY_ACTUATOR |
+  CELL_PAD_CAPABILITY_SENSOR_MODE,  // ✅ РАСКОММЕНТИРОВАНО: Поддержка Sixaxis
+  CELL_PAD_DEV_TYPE_STANDARD,
+  CELL_PAD_PCLASS_TYPE_STANDARD,
+  0,  // class_profile
+  0,  // vendor_id
+  0,  // product_id
+  50  // pressure_intensity_percent
+ );
+ 
  return true;
 }
 
 extern "C" bool _rpcsx_overlayPadData(jint digital1, jint digital2,
  jint leftStickX, jint leftStickY,
  jint rightStickX, jint rightStickY) {
- auto pad = [] {
+ auto handler = [] {
  std::shared_ptr<virtual_pad_handler> result;
  std::lock_guard lock(g_virtual_pad_mutex);
  result = g_virtual_pad;
  return result;
  }();
 
- if (pad == nullptr) {
+ if (!handler) {
  return false;
  }
+ 
+ auto& bindings = handler->bindings();
+ if (bindings.empty() || !bindings[0].pad) {
+ return false;
+ }
+ 
+ auto pad = bindings[0].pad;
 
  for (auto &btn : pad->m_buttons) {
  if (btn.m_offset == CELL_PAD_BTN_OFFSET_DIGITAL1) {
  btn.m_pressed = (digital1 & btn.m_outKeyCode) != 0;
+
  if (btn.m_outKeyCode == CELL_PAD_CTRL_PS && btn.m_pressed) {
  if (auto padThread = pad::get_pad_thread(true)) {
  padThread->open_home_menu();
  }
  }
+
  } else if (btn.m_offset == CELL_PAD_BTN_OFFSET_DIGITAL2) {
  btn.m_pressed = (digital2 & btn.m_outKeyCode) != 0;
  }
+
  btn.m_value = btn.m_pressed ? 255 : 0;
  }
 
@@ -946,22 +936,23 @@ extern "C" bool _rpcsx_overlayPadData(jint digital1, jint digital2,
 // ==========================================
 extern "C" bool _rpcsx_setMotionData(float accelX, float accelY, float accelZ,
  float gyroX, float gyroY, float gyroZ) {
- auto pad = [] {
+ auto handler = [] {
  std::shared_ptr<virtual_pad_handler> result;
  std::lock_guard lock(g_virtual_pad_mutex);
  result = g_virtual_pad;
  return result;
  }();
 
- if (pad == nullptr) {
+ if (!handler) {
  return false;
  }
-
- // Конвертируем Android сенсоры в формат DS3
- // Android акселерометр: m/s² (-19.6..19.6)
- // DS3 акселерометр: 10-bit (0-1023), центр 512
- // Android гироскоп: rad/s (-34.9..34.9)
- // DS3 гироскоп: 10-bit (0-1023), центр 512
+ 
+ auto& bindings = handler->bindings();
+ if (bindings.empty() || !bindings[0].pad) {
+ return false;
+ }
+ 
+ auto pad = bindings[0].pad;
 
  auto convertAccel = [](float value) -> u16 {
  float normalized = (value / 19.6f) * 512.0f + 512.0f;
@@ -973,29 +964,31 @@ extern "C" bool _rpcsx_setMotionData(float accelX, float accelY, float accelZ,
  return static_cast<u16>(std::clamp(normalized, 0.0f, 1023.0f));
  };
 
- // Обновляем акселерометр (3 оси)
+ // ✅ Обновляем m_sensors (4 сенсора)
  pad->m_sensors[0].m_value = convertAccel(accelX);
  pad->m_sensors[1].m_value = convertAccel(accelY);
  pad->m_sensors[2].m_value = convertAccel(accelZ);
-
- // ✅ ИСПРАВЛЕНО: Обновляем гироскоп (3 оси вместо 1)
  pad->m_sensors[3].m_value = convertGyro(gyroX);
- pad->m_sensors[4].m_value = convertGyro(gyroY);
- pad->m_sensors[5].m_value = convertGyro(gyroZ);
-
- // ✅ НОВОЕ: Обновляем move_data для совместимости с играми
- pad->move_data.accelerometer_x = pad->m_sensors[0].m_value;
- pad->move_data.accelerometer_y = pad->m_sensors[1].m_value;
- pad->move_data.accelerometer_z = pad->m_sensors[2].m_value;
- pad->move_data.gyro_x = pad->m_sensors[3].m_value;
- pad->move_data.gyro_y = pad->m_sensors[4].m_value;
- pad->move_data.gyro_z = pad->m_sensors[5].m_value;
+ 
+ // ✅ Также обновляем отдельные поля сенсоров
+ pad->m_sensor_x = convertAccel(accelX);
+ pad->m_sensor_y = convertAccel(accelY);
+ pad->m_sensor_z = convertAccel(accelZ);
+ pad->m_sensor_g = convertGyro(gyroX);
+ 
+ // ✅ Обновляем move_data для полной совместимости с играми
+ pad->move_data.accelerometer_x = accelX;
+ pad->move_data.accelerometer_y = accelY;
+ pad->move_data.accelerometer_z = accelZ;
+ pad->move_data.gyro_x = gyroX;
+ pad->move_data.gyro_y = gyroY;
+ pad->move_data.gyro_z = gyroZ;
 
  return true;
 }
 
 // ==========================================
-// ✅ НОВАЯ JNI ОБЕРТКА
+// ✅ НОВАЯ JNI ОБЕРТКА для Sixaxis
 // ==========================================
 extern "C" JNIEXPORT jboolean JNICALL
 Java_net_rpcsx_RPCSX_setMotionData(
@@ -1036,7 +1029,7 @@ extern "C" bool _rpcsx_initialize(std::string_view rootDir,
  }
 
  // Initialize thread pool finalizer // ???
- static_cast<void>(named_thread<void>("", [] {}));
+ static_cast<void>(named_thread("", [] {}));
 
  static std::unique_ptr<logs::listener> log_file;
  {
@@ -1048,7 +1041,7 @@ extern "C" bool _rpcsx_initialize(std::string_view rootDir,
  stats.avail_free / 1000000.);
  }
 
- // preserve old log file
+ // preserve log file
  if (std::filesystem::exists(fs::get_log_dir() + "RPCSX.log")) {
  std::error_code ec;
  std::filesystem::remove(fs::get_log_dir() + "RPCSX.old.log", ec);
@@ -1062,7 +1055,7 @@ extern "C" bool _rpcsx_initialize(std::string_view rootDir,
  }
 
  logs::stored_message ver{rpcsx_android.always()};
- ver.text = fmt::format("RPCSX-ps3-android v{}", rx::getVersion().toString());
+ ver.text = fmt::format("RPCSX-ps3-android v%s", rx::getVersion().toString());
 
  // Write System information
  logs::stored_message sys{rpcsx_android.always()};
@@ -1074,7 +1067,7 @@ extern "C" bool _rpcsx_initialize(std::string_view rootDir,
 
  // Write current time
  logs::stored_message time{rpcsx_android.always()};
- time.text = fmt::format("Current Time: {}", std::chrono::system_clock::now());
+ time.text = fmt::format("Current Time: %s", std::chrono::system_clock::now());
 
  logs::set_init(
  {std::move(ver), std::move(sys), std::move(os), std::move(time)});
@@ -1082,16 +1075,16 @@ extern "C" bool _rpcsx_initialize(std::string_view rootDir,
  auto set_rlim = [](int resource, uint64_t limit) {
  rlimit64 rlim{};
  if (getrlimit64(resource, &rlim) != 0) {
- rpcsx_android.error("failed to get rlimit for {}", resource);
+ rpcsx_android.error("failed to get rlimit for %d", resource);
  return;
  }
 
- rlim.rlim_cur = std::min<rlim64_t>(rlim.rlim_max, limit);
- rpcsx_android.error("rlimit[{}] = {} (requested {}, max {})", resource,
+ rlim.rlim_cur = std::min(rlim.rlim_max, limit);
+ rpcsx_android.error("rlimit[%d] = %u (requested %u, max %u)", resource,
  rlim.rlim_cur, limit, rlim.rlim_max);
 
  if (setrlimit64(resource, &rlim) != 0) {
- rpcsx_android.error("failed to set rlimit for {}", resource);
+ rpcsx_android.error("failed to set rlimit for %d", resource);
  return;
  }
  };
@@ -1209,7 +1202,7 @@ extern "C" bool _rpcsx_surfaceEvent(JNIEnv *env, jobject surface, jint event) {
 extern "C" bool _rpcsx_usbDeviceEvent(int fd, int vendorId, int productId,
  int event) {
  rpcsx_android.warning(
- "usb device event {} fd: {}, vendorId: {}, productId: {}", event, fd,
+ "usb device event %d fd: %d, vendorId: %d, productId: %d", event, fd,
  vendorId, productId);
 
  {
@@ -1235,11 +1228,11 @@ extern "C" bool _rpcsx_usbDeviceEvent(int fd, int vendorId, int productId,
  std::string selectedDevice;
 
  std::map<pad_handler,
- std::pair<std::unique_ptr<PadHandlerBase>,
- std::vector<std::string>>>
+ std::pair<std::unique_ptr<pad_handler>, std::vector<std::string>>>
  handlerToDevices;
 
- auto collectDevices = [&]<typename T>(T handler) {
+ auto collectDevices = [&]<typename T> {
+ auto handler = std::make_unique<T>();
  handler->Init();
 
  std::vector<std::string> devices;
@@ -1255,9 +1248,9 @@ extern "C" bool _rpcsx_usbDeviceEvent(int fd, int vendorId, int productId,
  };
  };
 
- collectDevices(std::make_unique<dualsense_pad_handler>());
- collectDevices(std::make_unique<ds4_pad_handler>());
- collectDevices(std::make_unique<ds3_pad_handler>());
+ collectDevices.template operator()<ds3_pad_handler>();
+ collectDevices.template operator()<ds4_pad_handler>();
+ collectDevices.template operator()<dualsense_pad_handler>();
 
  if (handlerToDevices[selectedHandler].second.empty()) {
  selectedHandler = pad_handler::null;
@@ -1276,7 +1269,7 @@ extern "C" bool _rpcsx_usbDeviceEvent(int fd, int vendorId, int productId,
  }
 
  if (selectedHandler != g_cfg_input.player1.handler.get()) {
- rpcsx_android.warning("install {} pad handler", selectedHandler);
+ rpcsx_android.warning("install %s pad handler", selectedHandler);
 
  g_cfg_input.player1.handler.set(selectedHandler);
 
@@ -1313,13 +1306,13 @@ static bool installPup(JNIEnv *env, fs::file &&pup_f, jlong progressId) {
  pup_object pup(std::move(pup_f));
  AtExit atExit{[&] { pup.file().release_handle(); }};
 
- if (static_cast<pup_error>(pup) == pup_error::hash_mismatch) {
+ if (static_cast<u32>(pup) == pup_error::hash_mismatch) {
  rpcsx_android.fatal("installFw: invalid PUP");
  progress.failure("Selected file is not firmware update file");
  return false;
  }
 
- if (static_cast<pup_error>(pup) != pup_error::ok) {
+ if (static_cast<u32>(pup) != pup_error::ok) {
  rpcsx_android.fatal("installFw: invalid PUP");
  progress.failure("Firmware update file is broken");
  return false;
@@ -1402,10 +1395,10 @@ static bool installPup(JNIEnv *env, fs::file &&pup_f, jlong progressId) {
  if (!dev_flash_tar.extract()) {
 
  rpcsx_android.error("Error while installing firmware: TAR contents are "
- "invalid. (package={})",
+ "invalid. (package=%s)",
  update_filename);
 
- progress.failure(fmt::format("TAR contents are invalid (package={})",
+ progress.failure(fmt::format("TAR contents are invalid (package=%s)",
  update_filename));
  return false;
  }
@@ -1437,7 +1430,7 @@ static bool installPkg(JNIEnv *env, fs::file &&file, jlong progressId) {
  }};
 
  package_install_result result = {};
- named_thread worker("PKG Installer", [&](auto &readers, &result, &bootable_paths) {
+ named_thread worker("PKG Installer", [&, &readers, &result, &bootable_paths] {
  result = package_reader::extract_data(readers, bootable_paths);
  return result.error == package_install_result::error_type::no_error;
  });
@@ -1482,7 +1475,7 @@ static bool installPkg(JNIEnv *env, fs::file &&file, jlong progressId) {
  }
 
  if (worker()) {
- auto paths = std::vector(bootable_paths.begin(), bootable_paths.end());
+ auto paths = std::vector<std::string>(bootable_paths.begin(), bootable_paths.end());
  collectGameInfo(env, -1, paths);
 
  for (auto &path : paths) {
@@ -1517,19 +1510,19 @@ static bool installEdat(JNIEnv *env, fs::file &&file, jlong progressId,
 
  if (contentId != npdHeader.content_id) {
  progress.failure(fmt::format("File cannot be used for this game. EDAT "
- "content ID missmatch {} vs {}",
+ "content ID missmatch %s vs %s",
  contentId, npdHeader.content_id));
  return false;
  }
  }
 
  const auto licenseFile =
- fmt::format("{}home/{}/exdata/{}.edat", rpcs3::utils::get_hdd0_dir(),
+ fmt::format("%shome/%s/exdata/%s.edat", rpcs3::utils::get_hdd0_dir(),
  Emu.GetUsr(), npdHeader.content_id);
 
  file.seek(0);
 
- std::vector<std::uint8_t> bytes(file.size());
+ std::vector<u8> bytes(file.size());
  if (!file.read(bytes)) {
  progress.failure("Failed to read key");
  return false;
@@ -1537,7 +1530,7 @@ static bool installEdat(JNIEnv *env, fs::file &&file, jlong progressId,
 
  if (!fs::write_file(licenseFile, fs::open_mode::create + fs::open_mode::trunc,
  bytes)) {
- progress.failure(fmt::format("Failed to write EDAT to {}", licenseFile));
+ progress.failure(fmt::format("Failed to write EDAT to %s", licenseFile));
  return false;
  }
 
@@ -1557,7 +1550,7 @@ static bool installRap(JNIEnv *env, fs::file &&file, jlong progressId,
 
  auto ebootPath = locateEbootPath(rootPath);
 
- std::vector<std::uint8_t> bytes;
+ std::vector<u8> bytes;
  if (!file.read(bytes, 16)) {
  progress.failure("Failed to read key");
  return false;
@@ -1566,10 +1559,10 @@ static bool installRap(JNIEnv *env, fs::file &&file, jlong progressId,
  SelfAdditionalInfo info;
  decrypt_self(fs::file(ebootPath), nullptr, &info);
 
- auto npd = []() -> NPD_HEADER * {
+ auto npd = [&]() -> NPD_HEADER * {
  for (auto &supplemental : info.supplemental_hdr) {
  if (supplemental.type == 3) {
- return &supplemental.PS3_npd_header.npd;
+ return &supplemental.PS3_npdrm_header.npd;
  }
  }
 
@@ -1582,12 +1575,12 @@ static bool installRap(JNIEnv *env, fs::file &&file, jlong progressId,
  }
 
  const auto licenseFile =
- fmt::format("{}home/{}/exdata/{}.rap", rpcs3::utils::get_hdd0_dir(),
+ fmt::format("%shome/%s/exdata/%s.rap", rpcs3::utils::get_hdd0_dir(),
  Emu.GetUsr(), npd->content_id);
 
  if (!fs::write_file(licenseFile, fs::open_mode::create + fs::open_mode::trunc,
  bytes)) {
- progress.failure(fmt::format("Failed to write key to {}", licenseFile));
+ progress.failure(fmt::format("Failed to write key to %s", licenseFile));
  return false;
  }
 
@@ -1639,14 +1632,15 @@ static bool installIso(JNIEnv *env, fs::file &&file, jlong progressId) {
  std::size_t filesCount = 0;
 
  auto roots = [&] {
- std::vector<std::filesystem::path> result;
- std::vector<std::filesystem::path> workList;
+ std::vector<std::string> result;
+ std::vector<std::string> workList;
  workList.push_back({});
  result.push_back({});
 
  while (!workList.empty()) {
  auto path = std::move(workList.back());
  workList.pop_back();
+
  fs::dir dir;
  dir.reset(iso.open_dir(path));
 
@@ -1680,7 +1674,7 @@ static bool installIso(JNIEnv *env, fs::file &&file, jlong progressId) {
 
  std::filesystem::create_directories(rootDestPath, ec);
  if (ec) {
- progress.failure(fmt::format("Failed to create dir {}: {}",
+ progress.failure(fmt::format("Failed to create dir %s: %s",
  rootDestPath.string(), ec.message()));
  return false;
  }
@@ -1698,7 +1692,7 @@ static bool installIso(JNIEnv *env, fs::file &&file, jlong progressId) {
  if (entry.is_directory) {
  std::filesystem::create_directories(entryDestPath, ec);
  if (ec) {
- progress.failure(fmt::format("Failed to create dir {}: {}",
+ progress.failure(fmt::format("Failed to create dir %s: %s",
  entryDestPath.string(), ec.message()));
  return false;
  }
@@ -1708,7 +1702,7 @@ static bool installIso(JNIEnv *env, fs::file &&file, jlong progressId) {
  auto raw_file = iso.open(root / entry.name, fs::read);
 
  if (!raw_file) {
- progress.failure(fmt::format("Failed to open file in ISO: {}",
+ progress.failure(fmt::format("Failed to open file in ISO: %s",
  (root / entry.name).string()));
  return false;
  }
@@ -1718,8 +1712,8 @@ static bool installIso(JNIEnv *env, fs::file &&file, jlong progressId) {
 
  if (!fs::write_file(entryDestPath,
  fs::open_mode::create + fs::open_mode::trunc,
- file.to_vector<std::uint8_t>())) {
- progress.failure(fmt::format("Failed to write file: {}, dest {}",
+ file.to_vector<u8>())) {
+ progress.failure(fmt::format("Failed to write file: %s, dest %s",
  entryDestPath.string(),
  destinationPath.string()));
  return false;
@@ -1818,7 +1812,7 @@ extern "C" bool _rpcsx_installKey(JNIEnv *env, int fd, long progressId,
 extern "C" std::string _rpcsx_systemInfo() {
  std::string result;
 
- fmt::append(result, "{}\n\nLLVM CPU: {}\n\n", utils::get_system_info(),
+ fmt::append(result, "%s\n\nLLVM CPU: %s\n\n", utils::get_system_info(),
  fallback_cpu_detection());
 
  {
@@ -1829,7 +1823,7 @@ extern "C" std::string _rpcsx_systemInfo() {
  device_enum_context.enumerate_devices();
 
  for (const auto &gpu : gpus) {
- fmt::append(result, "GPU: {}\n\nDriver: {} (v{})\n\nVulkan: {}",
+ fmt::append(result, "GPU: %s\n\nDriver: %s (v%s)\n\nVulkan: %s",
  gpu.get_name(), gpu.get_driver_name(),
  gpu.get_driver_version(), gpu.get_driver_vk_version());
  }
@@ -1896,7 +1890,7 @@ extern "C" bool _rpcsx_settingsSet(std::string_view path,
  try {
  value = nlohmann::json::parse(valueString);
  } catch (...) {
- rpcsx_android.error("settingsSet: node {} passed with invalid json '{}'",
+ rpcsx_android.error("settingsSet: node %s passed with invalid json '%s'",
  path, valueString);
  return false;
  }
@@ -1904,12 +1898,12 @@ extern "C" bool _rpcsx_settingsSet(std::string_view path,
  auto root = find_cfg_node(&g_cfg, path);
 
  if (root == nullptr) {
- rpcsx_android.error("settingsSet: node {} not found", path);
+ rpcsx_android.error("settingsSet: node %s not found", path);
  return false;
  }
 
  if (!root->from_json(value, !Emu.IsStopped())) {
- rpcsx_android.error("settingsSet: node {} not accepts value '{}'", path,
+ rpcsx_android.error("settingsSet: node %s not accepts value '%s'", path,
  value.dump());
  return false;
  }
